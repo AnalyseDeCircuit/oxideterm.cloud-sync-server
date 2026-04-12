@@ -72,7 +72,7 @@ pub fn router(state: AppState) -> Router {
 
     let object_api = Router::new()
         .route(
-            "/v1/namespaces/{namespace}/objects/*path",
+            "/v1/namespaces/{namespace}/objects/{*path}",
             get(get_object).put(put_object),
         )
         .layer(DefaultBodyLimit::max(shared.max_object_size));

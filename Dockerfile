@@ -1,12 +1,12 @@
 # ── Build stage ──
-FROM rust:1.82-alpine AS builder
+FROM rust:1.85-alpine AS builder
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
-RUN cargo build --release --target x86_64-unknown-linux-musl
+RUN cargo build --locked --release --target x86_64-unknown-linux-musl
 RUN cp target/x86_64-unknown-linux-musl/release/oxideterm-cloud-sync-server /build/server
 
 # ── Runtime stage ──

@@ -1,6 +1,6 @@
 services:
   sync-server:
-    image: ghcr.io/analysedecircuit/oxideterm.cloud-sync-server:latest
+    image: ghcr.io/analysedecircuit/oxideterm.cloud-sync-server:${IMAGE_TAG}
     build: .
     container_name: oxideterm-cloud-sync
     restart: unless-stopped
@@ -16,6 +16,12 @@ services:
 
       # REQUIRED: Admin panel password
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+
+      # Recommended: keep admin sessions valid across restarts
+      - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET}
+
+      # Optional: trust X-Forwarded-For / X-Real-IP for login throttling when behind a trusted reverse proxy
+      - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS}
 
       # Optional: custom listen address
       # - LISTEN_ADDR=0.0.0.0:8730

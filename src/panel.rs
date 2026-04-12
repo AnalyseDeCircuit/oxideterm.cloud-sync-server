@@ -1,7 +1,7 @@
 // Copyright (C) 2026 AnalyseDeCircuit. Licensed under AGPL-3.0-or-later.
 
 use axum::{
-    extract::State,
+  extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{delete, get, post},
@@ -9,12 +9,16 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::sync::Arc;
+use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::{Duration, Instant}};
 
 use crate::api::AppState;
 use crate::auth;
 use crate::config::*;
 use crate::error::AppError;
+
+const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+const LOGIN_LOCKOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_LOGIN_FAILURES: u32 = 5;
 
 pub fn admin_router() -> Router<Arc<AppState>> {
     Router::new()
@@ -73,22 +77,45 @@ struct LoginRequest {
 
 async fn admin_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
+    ensure_login_allowed(&state, client_ip)?;
+
     let hash = state
         .admin_password_hash
         .as_ref()
         .ok_or_else(|| AppError::NotFound("Admin panel disabled".to_string()))?;
 
     if !auth::verify_admin_password(&body.password, hash) {
+        record_login_failure(&state, client_ip)?;
         return Err(AppError::Unauthorized("Invalid password".to_string()));
     }
+
+    clear_login_failures(&state, client_ip)?;
 
     let jwt = auth::create_admin_jwt(&state.jwt_secret)
         .map_err(|e| AppError::Internal(format!("JWT creation failed: {e}")))?;
 
     Ok(Json(json!({ "token": jwt })))
 }
+
+  fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, state: &AppState) -> IpAddr {
+    if !state.trust_proxy_headers {
+      return peer_ip;
+    }
+
+    headers
+      .get("x-forwarded-for")
+      .and_then(|value| value.to_str().ok())
+      .and_then(|value| value.split(',').next())
+      .or_else(|| headers.get("x-real-ip").and_then(|value| value.to_str().ok()))
+      .map(str::trim)
+      .and_then(|value| value.parse::<IpAddr>().ok())
+      .unwrap_or(peer_ip)
+  }
 
 // ── GET /admin/api/namespaces ──
 
@@ -177,11 +204,22 @@ async fn admin_create_token(
     verify_admin(&headers, &state)?;
 
     // Validate namespace pattern
-    if body.namespace_pattern.is_empty() {
+  if !auth::validate_namespace_pattern(&body.namespace_pattern) {
         return Err(AppError::BadRequest(
-            "Namespace pattern cannot be empty".to_string(),
+      "Namespace pattern must be '*' , an exact namespace, or a prefix ending with '*'"
+        .to_string(),
         ));
     }
+
+  let permissions = auth::normalize_permissions(
+    body.permissions
+      .unwrap_or_else(|| vec!["read".into(), "write".into()]),
+  );
+  if !auth::validate_permissions(&permissions) {
+    return Err(AppError::BadRequest(
+      "Permissions must be a non-empty subset of ['read', 'write']".to_string(),
+    ));
+  }
 
     // Generate a secure random token
     let raw_token = uuid::Uuid::new_v4().to_string();
@@ -193,7 +231,7 @@ async fn admin_create_token(
         name: body.name,
         token_hash,
         namespace_pattern: body.namespace_pattern,
-        permissions: body.permissions.unwrap_or_else(|| vec!["read".into(), "write".into()]),
+        permissions,
         created_at: chrono::Utc::now().to_rfc3339(),
         last_used_at: None,
     };
@@ -210,6 +248,72 @@ async fn admin_create_token(
         "createdAt": token.created_at,
     })))
 }
+
+  fn ensure_login_allowed(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+    let now = Instant::now();
+    let mut attempts = state
+      .login_attempts
+      .lock()
+      .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
+
+    attempts.retain(|_, attempt| {
+      if let Some(blocked_until) = attempt.blocked_until {
+        blocked_until > now
+      } else {
+        now.duration_since(attempt.first_failure_at) <= LOGIN_WINDOW
+      }
+    });
+
+    if let Some(attempt) = attempts.get(&ip) {
+      if let Some(blocked_until) = attempt.blocked_until {
+        if blocked_until > now {
+          let retry_after = blocked_until.duration_since(now).as_secs();
+          return Err(AppError::TooManyRequests(format!(
+            "Too many login attempts. Retry in {} seconds",
+            retry_after.max(1)
+          )));
+        }
+      }
+    }
+
+    Ok(())
+  }
+
+  fn record_login_failure(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+    let now = Instant::now();
+    let mut attempts = state
+      .login_attempts
+      .lock()
+      .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
+
+    let attempt = attempts.entry(ip).or_insert(crate::api::LoginAttemptState {
+      first_failure_at: now,
+      failures: 0,
+      blocked_until: None,
+    });
+
+    if now.duration_since(attempt.first_failure_at) > LOGIN_WINDOW {
+      attempt.first_failure_at = now;
+      attempt.failures = 0;
+      attempt.blocked_until = None;
+    }
+
+    attempt.failures += 1;
+    if attempt.failures >= MAX_LOGIN_FAILURES {
+      attempt.blocked_until = Some(now + LOGIN_LOCKOUT);
+    }
+
+    Ok(())
+  }
+
+  fn clear_login_failures(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+    let mut attempts = state
+      .login_attempts
+      .lock()
+      .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
+    attempts.remove(&ip);
+    Ok(())
+  }
 
 // ── DELETE /admin/api/tokens/:id ──
 

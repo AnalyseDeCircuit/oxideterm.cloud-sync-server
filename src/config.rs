@@ -97,6 +97,13 @@ pub struct ObjectWriteResponse {
     pub etag: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredObjectMetadata {
+    pub etag: String,
+    pub updated_at: String,
+}
+
 /// Metadata write request body (PUT /metadata).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

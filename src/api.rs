@@ -9,14 +9,37 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{collections::HashMap, net::IpAddr, sync::{Arc, Mutex}, time::Instant};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth;
 use crate::config::*;
 use crate::crypto;
-use crate::db::Database;
+use crate::db::{ConditionalWriteError, Database};
 use crate::error::AppError;
 use crate::panel;
+
+#[derive(Debug)]
+pub struct LoginAttemptState {
+    pub first_failure_at: Instant,
+    pub failures: u32,
+    pub blocked_until: Option<Instant>,
+}
+
+#[derive(Copy, Clone)]
+enum SyncPermission {
+    Read,
+    Write,
+}
+
+impl SyncPermission {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -24,6 +47,8 @@ pub struct AppState {
     pub encryption_key: Option<[u8; 32]>,
     pub admin_password_hash: Option<String>,
     pub jwt_secret: String,
+    pub login_attempts: Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
+    pub trust_proxy_headers: bool,
     pub max_blob_size: usize,
     pub max_object_size: usize,
 }
@@ -31,21 +56,38 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let shared = Arc::new(state);
 
-    let sync_api = Router::new()
+    let metadata_api = Router::new()
         .route(
             "/v1/namespaces/{namespace}/metadata",
             get(get_metadata).put(put_metadata),
         )
+        .layer(DefaultBodyLimit::max(256 * 1024));
+
+    let blob_api = Router::new()
         .route(
             "/v1/namespaces/{namespace}/blob",
             get(get_blob).put(put_blob),
         )
+        .layer(DefaultBodyLimit::max(shared.max_blob_size));
+
+    let object_api = Router::new()
         .route(
             "/v1/namespaces/{namespace}/objects/*path",
             get(get_object).put(put_object),
         )
+        .layer(DefaultBodyLimit::max(shared.max_object_size));
+
+    let sync_api = Router::new()
+        .merge(metadata_api)
+        .merge(blob_api)
+        .merge(object_api)
         .route("/health", get(health_check))
-        .layer(DefaultBodyLimit::max(shared.max_blob_size));
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        );
 
     let admin_api = panel::admin_router();
 
@@ -62,7 +104,7 @@ async fn health_check() -> impl IntoResponse {
 
 // ── Auth Helper ──
 
-fn extract_auth(headers: &HeaderMap, state: &AppState) -> Result<String, AppError> {
+fn extract_auth(headers: &HeaderMap, state: &AppState) -> Result<ApiToken, AppError> {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -89,33 +131,41 @@ fn extract_auth(headers: &HeaderMap, state: &AppState) -> Result<String, AppErro
         return Err(AppError::Unauthorized("Unsupported auth scheme".to_string()));
     };
 
-    // Look up token in database
-    let tokens = state
+    let token_hash = auth::hash_api_token(&token);
+    let token = state
         .db
-        .get_all_tokens()
+        .get_token_by_hash(&token_hash)
         .map_err(|e| AppError::Internal(format!("Token lookup error: {e}")))?;
 
-    let token_pairs: Vec<(String, String)> = tokens
-        .iter()
-        .map(|t| (t.token_hash.clone(), t.namespace_pattern.clone()))
-        .collect();
-
-    auth::authenticate_bearer(&token, &token_pairs)
-        .ok_or_else(|| AppError::Unauthorized("Invalid token".to_string()))
+    token.ok_or_else(|| AppError::Unauthorized("Invalid token".to_string()))
 }
 
-fn check_namespace_access(
+fn authorize_sync_request_with_permission(
     headers: &HeaderMap,
     state: &AppState,
     namespace: &str,
-) -> Result<(), AppError> {
-    let pattern = extract_auth(headers, state)?;
-    if !auth::namespace_matches(namespace, &pattern) {
-        return Err(AppError::Unauthorized(format!(
+    permission: SyncPermission,
+) -> Result<ApiToken, AppError> {
+    let token = extract_auth(headers, state)?;
+    if !auth::namespace_matches(namespace, &token.namespace_pattern) {
+        return Err(AppError::Forbidden(format!(
             "Token not authorized for namespace '{namespace}'"
         )));
     }
-    Ok(())
+
+    if !auth::permissions_allow(&token.permissions, permission.as_str()) {
+        return Err(AppError::Forbidden(format!(
+            "Token is missing '{}' permission",
+            permission.as_str()
+        )));
+    }
+
+    state
+        .db
+        .touch_token_last_used(&token.id, &chrono::Utc::now().to_rfc3339())
+        .map_err(|e| AppError::Internal(format!("Failed to update token audit info: {e}")))?;
+
+    Ok(token)
 }
 
 /// Decode and validate a namespace path parameter.
@@ -125,6 +175,39 @@ fn decode_namespace(raw: &str) -> Result<String, AppError> {
         .into_owned();
     validate_namespace(&decoded)?;
     Ok(decoded)
+}
+
+fn decode_object_path(raw: &str) -> Result<String, AppError> {
+    let decoded = urlencoding::decode(raw)
+        .map_err(|_| AppError::BadRequest("Invalid object path encoding".to_string()))?
+        .into_owned();
+
+    if decoded.is_empty() || decoded.len() > 1024 || decoded.chars().any(|c| c.is_control()) {
+        return Err(AppError::BadRequest(
+            "Object path must be 1-1024 visible characters".to_string(),
+        ));
+    }
+
+    Ok(decoded)
+}
+
+fn map_conditional_write_error(error: ConditionalWriteError) -> AppError {
+    match error {
+        ConditionalWriteError::Conflict {
+            remote_revision,
+            remote_etag,
+            message,
+        } => AppError::Conflict {
+            code: "etag_conflict_detected".to_string(),
+            message,
+            remote_revision,
+            remote_etag,
+        },
+        ConditionalWriteError::Storage(error) => AppError::Internal(format!("Database error: {error}")),
+        ConditionalWriteError::Serialization(error) => {
+            AppError::Internal(format!("Serialization error: {error}"))
+        }
+    }
 }
 
 /// Validate namespace names: 1-128 chars, alphanumeric + dash/underscore/dot only.
@@ -169,7 +252,7 @@ async fn get_metadata(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    check_namespace_access(&headers, &state, &namespace)?;
+    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Read)?;
 
     match state.db.get_metadata(&namespace)? {
         Some(data) => {
@@ -189,7 +272,7 @@ async fn put_metadata(
     Json(body): Json<MetadataWriteRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    check_namespace_access(&headers, &state, &namespace)?;
+    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Write)?;
 
     // Build new metadata from existing + request
     let existing = state
@@ -228,7 +311,7 @@ async fn get_blob(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    check_namespace_access(&headers, &state, &namespace)?;
+    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Read)?;
 
     let encrypted_blob = state
         .db
@@ -264,7 +347,7 @@ async fn put_blob(
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    check_namespace_access(&headers, &state, &namespace)?;
+    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Write)?;
 
     if body.len() > state.max_blob_size {
         return Err(AppError::PayloadTooLarge(format!(
@@ -274,7 +357,6 @@ async fn put_blob(
         )));
     }
 
-    // Concurrency control via If-Match / If-None-Match
     let existing_meta = state
         .db
         .get_metadata(&namespace)?
@@ -282,34 +364,6 @@ async fn put_blob(
 
     let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
     let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
-
-    if let Some(expected_etag) = if_match {
-        let current_etag = existing_meta
-            .as_ref()
-            .and_then(|m| m.etag.as_deref())
-            .unwrap_or("");
-        if current_etag != expected_etag {
-            return Err(AppError::Conflict {
-                code: "etag_conflict_detected".into(),
-                message: "Remote snapshot changed before upload completed".into(),
-                remote_revision: existing_meta
-                    .as_ref()
-                    .and_then(|m| m.revision.clone()),
-                remote_etag: existing_meta.as_ref().and_then(|m| m.etag.clone()),
-            });
-        }
-    } else if if_none_match == Some("*") {
-        if existing_meta.as_ref().is_some_and(|m| m.exists) {
-            return Err(AppError::Conflict {
-                code: "etag_conflict_detected".into(),
-                message: "Remote snapshot already exists".into(),
-                remote_revision: existing_meta
-                    .as_ref()
-                    .and_then(|m| m.revision.clone()),
-                remote_etag: existing_meta.as_ref().and_then(|m| m.etag.clone()),
-            });
-        }
-    }
 
     // Extract headers
     let revision = headers
@@ -351,7 +405,14 @@ async fn put_blob(
     let serialized_meta = serde_json::to_vec(&meta)?;
     state
         .db
-        .put_blob_with_metadata(&namespace, &encrypted, &serialized_meta)?;
+        .put_blob_if_matches(
+            &namespace,
+            if_match,
+            if_none_match == Some("*"),
+            &encrypted,
+            &serialized_meta,
+        )
+        .map_err(map_conditional_write_error)?;
 
     Ok(Json(WriteResponse {
         ok: true,
@@ -370,14 +431,14 @@ async fn get_object(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    check_namespace_access(&headers, &state, &namespace)?;
+    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Read)?;
 
-    let decoded_path = urlencoding::decode(&obj_path)
-        .map_err(|_| AppError::BadRequest("Invalid object path encoding".to_string()))?;
+    let decoded_path = decode_object_path(&obj_path)?;
 
     match state.db.get_object(&namespace, &decoded_path)? {
         Some(encrypted) => {
             let data = decrypt_if_needed(&state, &encrypted)?;
+            let object_meta = state.db.get_object_metadata(&namespace, &decoded_path)?;
 
             let content_type = if decoded_path.ends_with(".json") {
                 "application/json"
@@ -389,6 +450,11 @@ async fn get_object(
 
             let mut response_headers = HeaderMap::new();
             response_headers.insert("content-type", content_type.parse().unwrap());
+            if let Some(object_meta) = object_meta {
+                if let Ok(hv) = object_meta.etag.parse() {
+                    response_headers.insert("etag", hv);
+                }
+            }
 
             Ok((StatusCode::OK, response_headers, data).into_response())
         }
@@ -405,10 +471,9 @@ async fn put_object(
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    check_namespace_access(&headers, &state, &namespace)?;
+    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Write)?;
 
-    let decoded_path = urlencoding::decode(&obj_path)
-        .map_err(|_| AppError::BadRequest("Invalid object path encoding".to_string()))?;
+    let decoded_path = decode_object_path(&obj_path)?;
 
     if body.len() > state.max_object_size {
         return Err(AppError::PayloadTooLarge(format!(
@@ -419,9 +484,25 @@ async fn put_object(
     }
 
     let encrypted = encrypt_if_needed(&state, &body)?;
-    state.db.set_object(&namespace, &decoded_path, &encrypted)?;
-
     let etag = uuid::Uuid::new_v4().to_string();
+    let object_meta = StoredObjectMetadata {
+        etag: etag.clone(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
+    let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
+
+    state
+        .db
+        .put_object_if_matches(
+            &namespace,
+            &decoded_path,
+            if_match,
+            if_none_match == Some("*"),
+            &encrypted,
+            &object_meta,
+        )
+        .map_err(map_conditional_write_error)?;
 
     Ok(Json(ObjectWriteResponse {
         etag: Some(etag),

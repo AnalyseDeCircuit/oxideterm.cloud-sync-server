@@ -8,9 +8,11 @@ use serde_json::json;
 pub enum AppError {
     BadRequest(String),
     Unauthorized(String),
+    Forbidden(String),
     NotFound(String),
     Conflict { code: String, message: String, remote_revision: Option<String>, remote_etag: Option<String> },
     PayloadTooLarge(String),
+    TooManyRequests(String),
     Internal(String),
 }
 
@@ -22,6 +24,9 @@ impl IntoResponse for AppError {
             })),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, json!({
                 "error": { "code": "unauthorized", "message": msg }
+            })),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, json!({
+                "error": { "code": "forbidden", "message": msg }
             })),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, json!({
                 "error": { "code": "not_found", "message": msg }
@@ -39,6 +44,9 @@ impl IntoResponse for AppError {
             }
             AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, json!({
                 "error": { "code": "payload_too_large", "message": msg }
+            })),
+            AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, json!({
+                "error": { "code": "too_many_requests", "message": msg }
             })),
             AppError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);

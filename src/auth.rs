@@ -58,18 +58,6 @@ pub fn validate_admin_jwt(
     Ok(data.claims)
 }
 
-/// Authenticate a sync API request. Returns the namespace pattern associated with the token.
-/// Checks bearer token or basic auth credentials against stored token hashes.
-pub fn authenticate_bearer(token: &str, token_hashes: &[(String, String)]) -> Option<String> {
-    let incoming_hash = hash_api_token(token);
-    for (stored_hash, namespace_pattern) in token_hashes {
-        if incoming_hash == *stored_hash {
-            return Some(namespace_pattern.clone());
-        }
-    }
-    None
-}
-
 /// Check if a namespace matches a pattern.
 /// Patterns: "*" matches all, "exact-name" matches exactly, "prefix*" matches prefix.
 pub fn namespace_matches(namespace: &str, pattern: &str) -> bool {
@@ -80,6 +68,38 @@ pub fn namespace_matches(namespace: &str, pattern: &str) -> bool {
         return namespace.starts_with(prefix);
     }
     namespace == pattern
+}
+
+pub fn validate_namespace_pattern(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+
+    let candidate = pattern.strip_suffix('*').unwrap_or(pattern);
+    !candidate.is_empty()
+        && candidate
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+pub fn normalize_permissions(mut permissions: Vec<String>) -> Vec<String> {
+    permissions.iter_mut().for_each(|permission| {
+        *permission = permission.trim().to_ascii_lowercase();
+    });
+    permissions.sort();
+    permissions.dedup();
+    permissions
+}
+
+pub fn validate_permissions(permissions: &[String]) -> bool {
+    !permissions.is_empty()
+        && permissions
+            .iter()
+            .all(|permission| permission == "read" || permission == "write")
+}
+
+pub fn permissions_allow(permissions: &[String], required: &str) -> bool {
+    permissions.iter().any(|permission| permission == required)
 }
 
 #[cfg(test)]
@@ -110,6 +130,17 @@ mod tests {
         assert!(namespace_matches("team-prod", "team-*"));
         assert!(namespace_matches("team-staging", "team-*"));
         assert!(!namespace_matches("other-prod", "team-*"));
+    }
+
+    #[test]
+    fn permission_validation() {
+        assert!(validate_permissions(&normalize_permissions(vec!["read".into()])));
+        assert!(validate_permissions(&normalize_permissions(vec!["read".into(), "write".into()])));
+        assert!(!validate_permissions(&normalize_permissions(vec!["admin".into()])));
+        assert!(validate_namespace_pattern("*"));
+        assert!(validate_namespace_pattern("team-*"));
+        assert!(validate_namespace_pattern("team-prod"));
+        assert!(!validate_namespace_pattern(""));
     }
 
     #[test]

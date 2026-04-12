@@ -1,0 +1,22 @@
+# Build artifacts
+/target
+/debug
+/release
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env.local
+
+# Data files (never commit)
+*.db
+/data/

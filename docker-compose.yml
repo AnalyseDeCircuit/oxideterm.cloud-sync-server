@@ -1,0 +1,32 @@
+services:
+  sync-server:
+    image: ghcr.io/analysedecircuit/oxideterm.cloud-sync-server:latest
+    build: .
+    container_name: oxideterm-cloud-sync
+    restart: unless-stopped
+    ports:
+      - "8730:8730"
+    volumes:
+      - sync-data:/data
+    environment:
+      # REQUIRED: Generate with `openssl rand -hex 32`
+      # All stored data (blobs, objects) will be encrypted at rest with this key.
+      # ⚠️ If you lose this key, your synced data cannot be recovered.
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+
+      # REQUIRED: Admin panel password
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+
+      # Optional: custom listen address
+      # - LISTEN_ADDR=0.0.0.0:8730
+
+      # Optional: max upload sizes
+      # - MAX_BLOB_SIZE=67108864   # 64 MiB
+      # - MAX_OBJECT_SIZE=16777216 # 16 MiB
+
+      # Optional: log level
+      - RUST_LOG=oxideterm_cloud_sync_server=info,tower_http=info
+
+volumes:
+  sync-data:
+    driver: local

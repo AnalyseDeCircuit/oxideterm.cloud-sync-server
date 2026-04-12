@@ -1,0 +1,50 @@
+[package]
+name = "oxideterm-cloud-sync-server"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Self-hosted cloud sync server for OxideTerm — encrypted storage, structured sync, Docker-ready"
+repository = "https://github.com/AnalyseDeCircuit/oxideterm.cloud-sync-server"
+authors = ["AnalyseDeCircuit"]
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-gzip"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Storage
+redb = "2"
+
+# Crypto — server-side encryption at rest
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+
+# Auth
+bcrypt = "0.16"
+jsonwebtoken = "9"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+urlencoding = "2"
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive", "env"] }
+mime = "0.3"
+
+# Embedded admin panel
+rust-embed = { version = "8", features = ["compression"] }

@@ -122,7 +122,9 @@ impl Database {
     pub fn get_metadata(&self, namespace: &str) -> Result<Option<Vec<u8>>, redb::Error> {
         let read_txn = self.inner.begin_read()?;
         let table = read_txn.open_table(METADATA_TABLE)?;
-        Ok(table.get(metadata_key(namespace).as_str())?.map(|v| v.value().to_vec()))
+        Ok(table
+            .get(metadata_key(namespace).as_str())?
+            .map(|v| v.value().to_vec()))
     }
 
     pub fn set_metadata(&self, namespace: &str, data: &[u8]) -> Result<(), redb::Error> {
@@ -140,7 +142,9 @@ impl Database {
     pub fn get_blob(&self, namespace: &str) -> Result<Option<Vec<u8>>, redb::Error> {
         let read_txn = self.inner.begin_read()?;
         let table = read_txn.open_table(BLOB_TABLE)?;
-        Ok(table.get(blob_key(namespace).as_str())?.map(|v| v.value().to_vec()))
+        Ok(table
+            .get(blob_key(namespace).as_str())?
+            .map(|v| v.value().to_vec()))
     }
 
     /// Compare-and-set blob + metadata in a single transaction.
@@ -168,7 +172,9 @@ impl Database {
                     .unwrap_or("");
                 if current_etag != expected_etag {
                     return Err(ConditionalWriteError::Conflict {
-                        remote_revision: current_meta.as_ref().and_then(|meta| meta.revision.clone()),
+                        remote_revision: current_meta
+                            .as_ref()
+                            .and_then(|meta| meta.revision.clone()),
                         remote_etag: current_meta.as_ref().and_then(|meta| meta.etag.clone()),
                         message: "Remote snapshot changed before upload completed".to_string(),
                     });
@@ -194,7 +200,9 @@ impl Database {
     pub fn get_object(&self, namespace: &str, path: &str) -> Result<Option<Vec<u8>>, redb::Error> {
         let read_txn = self.inner.begin_read()?;
         let table = read_txn.open_table(OBJECT_TABLE)?;
-        Ok(table.get(object_key(namespace, path).as_str())?.map(|v| v.value().to_vec()))
+        Ok(table
+            .get(object_key(namespace, path).as_str())?
+            .map(|v| v.value().to_vec()))
     }
 
     pub fn get_object_metadata(
@@ -208,7 +216,9 @@ impl Database {
             .get(object_meta_key(namespace, path).as_str())?
             .map(|v| serde_json::from_slice::<StoredObjectMetadata>(v.value()))
             .transpose()
-            .map_err(|e| redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?)
+            .map_err(|e| {
+                redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?)
     }
 
     pub fn put_object_if_matches(
@@ -309,7 +319,9 @@ impl Database {
             .get(token_key(token_id.value()).as_str())?
             .map(|value| serde_json::from_slice::<ApiToken>(value.value()))
             .transpose()
-            .map_err(|e| redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?)
+            .map_err(|e| {
+                redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?)
     }
 
     pub fn set_token(&self, token: &ApiToken) -> Result<(), redb::Error> {
@@ -319,13 +331,16 @@ impl Database {
             let mut hash_table = write_txn.open_table(TOKEN_HASH_TABLE)?;
 
             if let Some(existing) = table.get(token_key(&token.id).as_str())? {
-                let existing = serde_json::from_slice::<ApiToken>(existing.value())
-                    .map_err(|e| redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                let existing =
+                    serde_json::from_slice::<ApiToken>(existing.value()).map_err(|e| {
+                        redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    })?;
                 hash_table.remove(existing.token_hash.as_str())?;
             }
 
-            let data = serde_json::to_vec(token)
-                .map_err(|e| redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            let data = serde_json::to_vec(token).map_err(|e| {
+                redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             table.insert(token_key(&token.id).as_str(), data.as_slice())?;
             hash_table.insert(token.token_hash.as_str(), token.id.as_str())?;
         }
@@ -343,11 +358,13 @@ impl Database {
             let Some(existing_data) = existing_data else {
                 return Ok(());
             };
-            let mut token = serde_json::from_slice::<ApiToken>(&existing_data)
-                .map_err(|e| redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            let mut token = serde_json::from_slice::<ApiToken>(&existing_data).map_err(|e| {
+                redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             token.last_used_at = Some(last_used_at.to_string());
-            let data = serde_json::to_vec(&token)
-                .map_err(|e| redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+            let data = serde_json::to_vec(&token).map_err(|e| {
+                redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
             table.insert(token_key(id).as_str(), data.as_slice())?;
         }
         write_txn.commit()?;
@@ -360,8 +377,10 @@ impl Database {
             let mut table = write_txn.open_table(TOKEN_TABLE)?;
             let mut hash_table = write_txn.open_table(TOKEN_HASH_TABLE)?;
             if let Some(existing) = table.get(token_key(id).as_str())? {
-                let existing = serde_json::from_slice::<ApiToken>(existing.value())
-                    .map_err(|e| redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+                let existing =
+                    serde_json::from_slice::<ApiToken>(existing.value()).map_err(|e| {
+                        redb::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                    })?;
                 hash_table.remove(existing.token_hash.as_str())?;
             }
             table.remove(token_key(id).as_str())?;

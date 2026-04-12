@@ -88,9 +88,11 @@ cargo build --release
 1. Open OxideTerm → Plugins → Cloud Sync
 2. Select **HTTP JSON** backend
 3. Set endpoint to `http://your-server:8730`
-4. In the admin panel (`http://your-server:8730/admin`), create an API token
+4. Open the admin panel at `http://your-server:8730` (redirects to `/admin`), create a namespace and an API token
 5. Paste the token into the plugin's "Bearer Token" field
 6. Click "Upload" to sync
+
+The client-side plugin is open source: **[OxideTerm Cloud Sync Plugin](https://github.com/AnalyseDeCircuit/oxideterm.cloud-sync)**.
 
 ## Security
 
@@ -143,6 +145,7 @@ When `ENCRYPTION_KEY` is *not* set:
 | `POST` | `/admin/api/login` | Admin login |
 | `GET` | `/admin/api/stats` | Server statistics |
 | `GET` | `/admin/api/namespaces` | List all namespaces |
+| `POST` | `/admin/api/namespaces` | Create a namespace |
 | `DELETE` | `/admin/api/namespaces/:ns` | Delete a namespace |
 | `GET` | `/admin/api/tokens` | List API tokens |
 | `POST` | `/admin/api/tokens` | Create API token |

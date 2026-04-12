@@ -88,9 +88,11 @@ cargo build --release
 1. 打开 OxideTerm → 插件 → Cloud Sync
 2. 选择 **HTTP JSON** 后端
 3. 设置端点为 `http://你的服务器:8730`
-4. 在管理面板 (`http://你的服务器:8730/admin`) 中创建 API Token
+4. 打开管理面板 `http://你的服务器:8730`（自动跳转到 `/admin`），创建命名空间和 API Token
 5. 将 Token 粘贴到插件的 "Bearer Token" 字段
 6. 点击 "Upload" 开始同步
+
+客户端插件已开源：**[OxideTerm Cloud Sync 插件](https://github.com/AnalyseDeCircuit/oxideterm.cloud-sync)**。
 
 ## 安全
 
@@ -143,6 +145,7 @@ cargo build --release
 | `POST` | `/admin/api/login` | 管理员登录 |
 | `GET` | `/admin/api/stats` | 服务器统计 |
 | `GET` | `/admin/api/namespaces` | 列出所有命名空间 |
+| `POST` | `/admin/api/namespaces` | 创建命名空间 |
 | `DELETE` | `/admin/api/namespaces/:ns` | 删除命名空间 |
 | `GET` | `/admin/api/tokens` | 列出 API Token |
 | `POST` | `/admin/api/tokens` | 创建 API Token |

@@ -73,9 +73,10 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            "oxideterm_cloud_sync_server=info,tower_http=info".into()
-        }))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "oxideterm_cloud_sync_server=info,tower_http=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -89,9 +90,9 @@ async fn main() {
         crypto::parse_hex_key(hex_key).expect("ENCRYPTION_KEY must be 64 hex chars (32 bytes)")
     });
 
-    let admin_password_hash = admin_password_raw.as_deref().map(|pw| {
-        auth::hash_admin_password(pw).expect("Failed to hash admin password")
-    });
+    let admin_password_hash = admin_password_raw
+        .as_deref()
+        .map(|pw| auth::hash_admin_password(pw).expect("Failed to hash admin password"));
 
     let database = db::Database::open(&cli.db_path).expect("Failed to open database");
 
@@ -108,8 +109,7 @@ async fn main() {
         max_object_size: cli.max_object_size,
     };
 
-    let app = api::router(state)
-        .layer(TraceLayer::new_for_http());
+    let app = api::router(state).layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(cli.listen)
         .await
@@ -132,7 +132,10 @@ async fn main() {
         tracing::info!("Admin panel: DISABLED (set ADMIN_PASSWORD to enable)");
     }
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .expect("Server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("Server error");
 }

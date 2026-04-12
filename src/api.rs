@@ -4,12 +4,17 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::get,
     Json, Router,
 };
 use serde_json::json;
-use std::{collections::HashMap, net::IpAddr, sync::{Arc, Mutex}, time::Instant};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth;
@@ -81,6 +86,7 @@ pub fn router(state: AppState) -> Router {
         .merge(metadata_api)
         .merge(blob_api)
         .merge(object_api)
+        .route("/", get(|| async { Redirect::temporary("/admin") }))
         .route("/health", get(health_check))
         .layer(
             CorsLayer::new()
@@ -91,9 +97,7 @@ pub fn router(state: AppState) -> Router {
 
     let admin_api = panel::admin_router();
 
-    sync_api
-        .merge(admin_api)
-        .with_state(shared)
+    sync_api.merge(admin_api).with_state(shared)
 }
 
 // ── Health Check ──
@@ -114,11 +118,9 @@ fn extract_auth(headers: &HeaderMap, state: &AppState) -> Result<ApiToken, AppEr
         bearer.trim().to_string()
     } else if let Some(basic) = auth_header.strip_prefix("Basic ") {
         // Decode basic auth, extract password portion as token
-        let decoded = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            basic.trim(),
-        )
-        .map_err(|_| AppError::Unauthorized("Invalid Basic auth encoding".to_string()))?;
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, basic.trim())
+                .map_err(|_| AppError::Unauthorized("Invalid Basic auth encoding".to_string()))?;
         let credential = String::from_utf8(decoded)
             .map_err(|_| AppError::Unauthorized("Invalid Basic auth encoding".to_string()))?;
         // Format: username:password — extract password as the token
@@ -128,7 +130,9 @@ fn extract_auth(headers: &HeaderMap, state: &AppState) -> Result<ApiToken, AppEr
             .unwrap_or(&credential)
             .to_string()
     } else {
-        return Err(AppError::Unauthorized("Unsupported auth scheme".to_string()));
+        return Err(AppError::Unauthorized(
+            "Unsupported auth scheme".to_string(),
+        ));
     };
 
     let token_hash = auth::hash_api_token(&token);
@@ -203,7 +207,9 @@ fn map_conditional_write_error(error: ConditionalWriteError) -> AppError {
             remote_revision,
             remote_etag,
         },
-        ConditionalWriteError::Storage(error) => AppError::Internal(format!("Database error: {error}")),
+        ConditionalWriteError::Storage(error) => {
+            AppError::Internal(format!("Database error: {error}"))
+        }
         ConditionalWriteError::Serialization(error) => {
             AppError::Internal(format!("Serialization error: {error}"))
         }
@@ -211,7 +217,7 @@ fn map_conditional_write_error(error: ConditionalWriteError) -> AppError {
 }
 
 /// Validate namespace names: 1-128 chars, alphanumeric + dash/underscore/dot only.
-fn validate_namespace(ns: &str) -> Result<(), AppError> {
+pub(crate) fn validate_namespace(ns: &str) -> Result<(), AppError> {
     if ns.is_empty() || ns.len() > 128 {
         return Err(AppError::BadRequest(
             "Namespace must be 1-128 characters".to_string(),
@@ -288,7 +294,9 @@ async fn put_metadata(
         revision: Some(body.revision),
         etag: Some(etag.clone()),
         content_hash: existing.as_ref().and_then(|e| e.content_hash.clone()),
-        uploaded_at: body.uploaded_at.or_else(|| Some(chrono::Utc::now().to_rfc3339())),
+        uploaded_at: body
+            .uploaded_at
+            .or_else(|| Some(chrono::Utc::now().to_rfc3339())),
         device_id: body.device_id,
         content_length: existing.as_ref().map(|e| e.content_length).unwrap_or(0),
         section_revisions: body.section_revisions,
@@ -328,7 +336,10 @@ async fn get_blob(
         .and_then(|m| m.etag);
 
     let mut response_headers = HeaderMap::new();
-    response_headers.insert("content-type", "application/vnd.oxideterm.oxide".parse().unwrap());
+    response_headers.insert(
+        "content-type",
+        "application/vnd.oxideterm.oxide".parse().unwrap(),
+    );
     if let Some(etag_val) = etag {
         if let Ok(hv) = etag_val.parse() {
             response_headers.insert("etag", hv);
@@ -377,8 +388,8 @@ async fn put_blob(
     let section_revisions_raw = headers
         .get("x-oxideterm-section-revisions")
         .and_then(|v| v.to_str().ok());
-    let section_revisions: Option<SectionRevisions> = section_revisions_raw
-        .and_then(|raw| serde_json::from_str(raw).ok());
+    let section_revisions: Option<SectionRevisions> =
+        section_revisions_raw.and_then(|raw| serde_json::from_str(raw).ok());
 
     // Encrypt and store
     let content_hash = crypto::sha256_hex(&body);
@@ -504,7 +515,5 @@ async fn put_object(
         )
         .map_err(map_conditional_write_error)?;
 
-    Ok(Json(ObjectWriteResponse {
-        etag: Some(etag),
-    }))
+    Ok(Json(ObjectWriteResponse { etag: Some(etag) }))
 }

@@ -10,7 +10,12 @@ pub enum AppError {
     Unauthorized(String),
     Forbidden(String),
     NotFound(String),
-    Conflict { code: String, message: String, remote_revision: Option<String>, remote_etag: Option<String> },
+    Conflict {
+        code: String,
+        message: String,
+        remote_revision: Option<String>,
+        remote_etag: Option<String>,
+    },
     PayloadTooLarge(String),
     TooManyRequests(String),
     Internal(String),
@@ -19,20 +24,38 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, body) = match self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, json!({
-                "error": { "code": "bad_request", "message": msg }
-            })),
-            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, json!({
-                "error": { "code": "unauthorized", "message": msg }
-            })),
-            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, json!({
-                "error": { "code": "forbidden", "message": msg }
-            })),
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, json!({
-                "error": { "code": "not_found", "message": msg }
-            })),
-            AppError::Conflict { code, message, remote_revision, remote_etag } => {
-                (StatusCode::PRECONDITION_FAILED, json!({
+            AppError::BadRequest(msg) => (
+                StatusCode::BAD_REQUEST,
+                json!({
+                    "error": { "code": "bad_request", "message": msg }
+                }),
+            ),
+            AppError::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                json!({
+                    "error": { "code": "unauthorized", "message": msg }
+                }),
+            ),
+            AppError::Forbidden(msg) => (
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": { "code": "forbidden", "message": msg }
+                }),
+            ),
+            AppError::NotFound(msg) => (
+                StatusCode::NOT_FOUND,
+                json!({
+                    "error": { "code": "not_found", "message": msg }
+                }),
+            ),
+            AppError::Conflict {
+                code,
+                message,
+                remote_revision,
+                remote_etag,
+            } => (
+                StatusCode::PRECONDITION_FAILED,
+                json!({
                     "ok": false,
                     "error": {
                         "code": code,
@@ -40,19 +63,28 @@ impl IntoResponse for AppError {
                         "remoteRevision": remote_revision,
                         "remoteEtag": remote_etag
                     }
-                }))
-            }
-            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, json!({
-                "error": { "code": "payload_too_large", "message": msg }
-            })),
-            AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, json!({
-                "error": { "code": "too_many_requests", "message": msg }
-            })),
+                }),
+            ),
+            AppError::PayloadTooLarge(msg) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({
+                    "error": { "code": "payload_too_large", "message": msg }
+                }),
+            ),
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({
+                    "error": { "code": "too_many_requests", "message": msg }
+                }),
+            ),
             AppError::Internal(msg) => {
                 tracing::error!("Internal error: {}", msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, json!({
-                    "error": { "code": "internal_error", "message": "Internal server error" }
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({
+                        "error": { "code": "internal_error", "message": "Internal server error" }
+                    }),
+                )
             }
         };
         (status, axum::Json(body)).into_response()

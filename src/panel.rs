@@ -1,7 +1,7 @@
 // Copyright (C) 2026 AnalyseDeCircuit. Licensed under AGPL-3.0-or-later.
 
 use axum::{
-  extract::{ConnectInfo, State},
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{delete, get, post},
@@ -9,7 +9,11 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::{net::{IpAddr, SocketAddr}, sync::Arc, time::{Duration, Instant}};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::api::AppState;
 use crate::auth;
@@ -26,7 +30,10 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/admin", get(admin_page))
         // Admin API
         .route("/admin/api/login", post(admin_login))
-        .route("/admin/api/namespaces", get(admin_list_namespaces))
+        .route(
+            "/admin/api/namespaces",
+            get(admin_list_namespaces).post(admin_create_namespace),
+        )
         .route(
             "/admin/api/namespaces/{namespace}",
             delete(admin_delete_namespace),
@@ -63,7 +70,10 @@ fn verify_admin(headers: &HeaderMap, state: &AppState) -> Result<(), AppError> {
 
 async fn admin_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.admin_password_hash.is_none() {
-        return (StatusCode::NOT_FOUND, Html("Admin panel disabled".to_string()));
+        return (
+            StatusCode::NOT_FOUND,
+            Html("Admin panel disabled".to_string()),
+        );
     }
     (StatusCode::OK, Html(ADMIN_HTML.to_string()))
 }
@@ -102,20 +112,24 @@ async fn admin_login(
     Ok(Json(json!({ "token": jwt })))
 }
 
-  fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, state: &AppState) -> IpAddr {
+fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, state: &AppState) -> IpAddr {
     if !state.trust_proxy_headers {
-      return peer_ip;
+        return peer_ip;
     }
 
     headers
-      .get("x-forwarded-for")
-      .and_then(|value| value.to_str().ok())
-      .and_then(|value| value.split(',').next())
-      .or_else(|| headers.get("x-real-ip").and_then(|value| value.to_str().ok()))
-      .map(str::trim)
-      .and_then(|value| value.parse::<IpAddr>().ok())
-      .unwrap_or(peer_ip)
-  }
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::trim)
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or(peer_ip)
+}
 
 // ── GET /admin/api/namespaces ──
 
@@ -147,6 +161,40 @@ async fn admin_list_namespaces(
     }
 
     Ok(Json(infos))
+}
+
+// ── POST /admin/api/namespaces ──
+
+#[derive(Deserialize)]
+struct CreateNamespaceRequest {
+    namespace: String,
+}
+
+async fn admin_create_namespace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateNamespaceRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    verify_admin(&headers, &state)?;
+
+    let namespace = body.namespace.trim().to_string();
+    crate::api::validate_namespace(&namespace)?;
+
+    // Check if namespace already exists
+    if state.db.get_metadata(&namespace)?.is_some() {
+        return Err(AppError::BadRequest(format!(
+            "Namespace '{}' already exists",
+            namespace
+        )));
+    }
+
+    // Write empty metadata to create the namespace
+    let meta = SyncMetadata::empty();
+    let serialized = serde_json::to_vec(&meta)
+        .map_err(|e| AppError::Internal(format!("Failed to serialize metadata: {e}")))?;
+    state.db.set_metadata(&namespace, &serialized)?;
+
+    Ok(Json(json!({ "ok": true, "namespace": namespace })))
 }
 
 // ── DELETE /admin/api/namespaces/:namespace ──
@@ -204,22 +252,22 @@ async fn admin_create_token(
     verify_admin(&headers, &state)?;
 
     // Validate namespace pattern
-  if !auth::validate_namespace_pattern(&body.namespace_pattern) {
+    if !auth::validate_namespace_pattern(&body.namespace_pattern) {
         return Err(AppError::BadRequest(
-      "Namespace pattern must be '*' , an exact namespace, or a prefix ending with '*'"
-        .to_string(),
+            "Namespace pattern must be '*' , an exact namespace, or a prefix ending with '*'"
+                .to_string(),
         ));
     }
 
-  let permissions = auth::normalize_permissions(
-    body.permissions
-      .unwrap_or_else(|| vec!["read".into(), "write".into()]),
-  );
-  if !auth::validate_permissions(&permissions) {
-    return Err(AppError::BadRequest(
-      "Permissions must be a non-empty subset of ['read', 'write']".to_string(),
-    ));
-  }
+    let permissions = auth::normalize_permissions(
+        body.permissions
+            .unwrap_or_else(|| vec!["read".into(), "write".into()]),
+    );
+    if !auth::validate_permissions(&permissions) {
+        return Err(AppError::BadRequest(
+            "Permissions must be a non-empty subset of ['read', 'write']".to_string(),
+        ));
+    }
 
     // Generate a secure random token
     let raw_token = uuid::Uuid::new_v4().to_string();
@@ -249,71 +297,71 @@ async fn admin_create_token(
     })))
 }
 
-  fn ensure_login_allowed(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+fn ensure_login_allowed(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
     let now = Instant::now();
     let mut attempts = state
-      .login_attempts
-      .lock()
-      .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
+        .login_attempts
+        .lock()
+        .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
 
     attempts.retain(|_, attempt| {
-      if let Some(blocked_until) = attempt.blocked_until {
-        blocked_until > now
-      } else {
-        now.duration_since(attempt.first_failure_at) <= LOGIN_WINDOW
-      }
+        if let Some(blocked_until) = attempt.blocked_until {
+            blocked_until > now
+        } else {
+            now.duration_since(attempt.first_failure_at) <= LOGIN_WINDOW
+        }
     });
 
     if let Some(attempt) = attempts.get(&ip) {
-      if let Some(blocked_until) = attempt.blocked_until {
-        if blocked_until > now {
-          let retry_after = blocked_until.duration_since(now).as_secs();
-          return Err(AppError::TooManyRequests(format!(
-            "Too many login attempts. Retry in {} seconds",
-            retry_after.max(1)
-          )));
+        if let Some(blocked_until) = attempt.blocked_until {
+            if blocked_until > now {
+                let retry_after = blocked_until.duration_since(now).as_secs();
+                return Err(AppError::TooManyRequests(format!(
+                    "Too many login attempts. Retry in {} seconds",
+                    retry_after.max(1)
+                )));
+            }
         }
-      }
     }
 
     Ok(())
-  }
+}
 
-  fn record_login_failure(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+fn record_login_failure(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
     let now = Instant::now();
     let mut attempts = state
-      .login_attempts
-      .lock()
-      .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
+        .login_attempts
+        .lock()
+        .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
 
     let attempt = attempts.entry(ip).or_insert(crate::api::LoginAttemptState {
-      first_failure_at: now,
-      failures: 0,
-      blocked_until: None,
+        first_failure_at: now,
+        failures: 0,
+        blocked_until: None,
     });
 
     if now.duration_since(attempt.first_failure_at) > LOGIN_WINDOW {
-      attempt.first_failure_at = now;
-      attempt.failures = 0;
-      attempt.blocked_until = None;
+        attempt.first_failure_at = now;
+        attempt.failures = 0;
+        attempt.blocked_until = None;
     }
 
     attempt.failures += 1;
     if attempt.failures >= MAX_LOGIN_FAILURES {
-      attempt.blocked_until = Some(now + LOGIN_LOCKOUT);
+        attempt.blocked_until = Some(now + LOGIN_LOCKOUT);
     }
 
     Ok(())
-  }
+}
 
-  fn clear_login_failures(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+fn clear_login_failures(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
     let mut attempts = state
-      .login_attempts
-      .lock()
-      .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
+        .login_attempts
+        .lock()
+        .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
     attempts.remove(&ip);
     Ok(())
-  }
+}
 
 // ── DELETE /admin/api/tokens/:id ──
 
@@ -609,7 +657,18 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
 
   <!-- Namespaces -->
   <div class="card">
-    <h2>Namespaces</h2>
+    <div class="flex-between mb-1">
+      <h2>Namespaces</h2>
+      <button class="btn btn-primary btn-sm" onclick="showCreateNs()">Create Namespace</button>
+    </div>
+    <div id="create-ns-form" class="hidden" style="margin-bottom:1rem">
+      <div class="form-group">
+        <label>Namespace Name</label>
+        <input type="text" id="ns-name" placeholder="e.g. my-workspace">
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="createNs()">Create</button>
+      <button class="btn btn-sm" onclick="hideCreateNs()">Cancel</button>
+    </div>
     <div id="namespaces-table"></div>
   </div>
 </div>
@@ -776,6 +835,33 @@ async function deleteNs(ns) {
   if (!confirm(`Delete namespace "${ns}" and all its data? This cannot be undone.`)) return;
   try {
     await api(`/namespaces/${encodeURIComponent(ns)}`, { method: 'DELETE' });
+    loadNamespaces();
+    loadStats();
+  } catch {}
+}
+
+function showCreateNs() {
+  document.getElementById('create-ns-form').classList.remove('hidden');
+}
+function hideCreateNs() {
+  document.getElementById('create-ns-form').classList.add('hidden');
+}
+
+async function createNs() {
+  const name = document.getElementById('ns-name').value.trim();
+  if (!name) return;
+  try {
+    const res = await api('/namespaces', {
+      method: 'POST',
+      body: JSON.stringify({ namespace: name }),
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      alert(data.error?.message || 'Failed to create namespace');
+      return;
+    }
+    hideCreateNs();
+    document.getElementById('ns-name').value = '';
     loadNamespaces();
     loadStats();
   } catch {}

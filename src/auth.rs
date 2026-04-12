@@ -134,9 +134,16 @@ mod tests {
 
     #[test]
     fn permission_validation() {
-        assert!(validate_permissions(&normalize_permissions(vec!["read".into()])));
-        assert!(validate_permissions(&normalize_permissions(vec!["read".into(), "write".into()])));
-        assert!(!validate_permissions(&normalize_permissions(vec!["admin".into()])));
+        assert!(validate_permissions(&normalize_permissions(vec![
+            "read".into()
+        ])));
+        assert!(validate_permissions(&normalize_permissions(vec![
+            "read".into(),
+            "write".into()
+        ])));
+        assert!(!validate_permissions(&normalize_permissions(vec![
+            "admin".into()
+        ])));
         assert!(validate_namespace_pattern("*"));
         assert!(validate_namespace_pattern("team-*"));
         assert!(validate_namespace_pattern("team-prod"));

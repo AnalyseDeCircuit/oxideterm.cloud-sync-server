@@ -129,6 +129,8 @@ pub struct NamespaceInfo {
     pub blob_size: u64,
     pub object_count: u64,
     pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
 }
 
 /// Admin panel: API token record.
@@ -143,6 +145,41 @@ pub struct ApiToken {
     pub namespace_pattern: String,
     pub permissions: Vec<String>,
     pub created_at: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug)]
+pub struct MetadataRetentionConfig {
+    pub store_revision: bool,
+    pub store_uploaded_at: bool,
+    pub store_device_id: bool,
+    pub store_content_hash: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginAttemptRecord {
+    pub first_failure_at: String,
+    pub failures: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_until: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedNamespaceRecord {
+    pub deleted_at: String,
 }

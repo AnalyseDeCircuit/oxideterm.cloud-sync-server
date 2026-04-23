@@ -1,8 +1,8 @@
 // Copyright (C) 2026 AnalyseDeCircuit. Licensed under AGPL-3.0-or-later.
 
 use axum::{
-    extract::{ConnectInfo, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse},
     routing::{delete, get, post},
     Json, Router,
@@ -13,7 +13,6 @@ use serde_json::json;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use crate::api::AppState;
@@ -22,16 +21,14 @@ use crate::config::*;
 use crate::crypto;
 use crate::error::AppError;
 
-const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
-const LOGIN_LOCKOUT: Duration = Duration::from_secs(15 * 60);
-const MAX_LOGIN_FAILURES: u32 = 5;
+const ADMIN_COOKIE_NAME: &str = "admin_session";
+const ADMIN_COOKIE_PATH: &str = "/admin";
 
 pub fn admin_router() -> Router<Arc<AppState>> {
     Router::new()
-        // Admin SPA
         .route("/admin", get(admin_page))
-        // Admin API
         .route("/admin/api/login", post(admin_login))
+        .route("/admin/api/logout", post(admin_logout))
         .route(
             "/admin/api/namespaces",
             get(admin_list_namespaces).post(admin_create_namespace),
@@ -41,31 +38,225 @@ pub fn admin_router() -> Router<Arc<AppState>> {
             delete(admin_delete_namespace),
         )
         .route(
+            "/admin/api/namespaces/{namespace}/restore",
+            post(admin_restore_namespace),
+        )
+        .route(
             "/admin/api/tokens",
             get(admin_list_tokens).post(admin_create_token),
         )
-        .route("/admin/api/tokens/{id}", delete(admin_delete_token))
+        .route(
+            "/admin/api/tokens/{id}",
+            delete(admin_delete_token).patch(admin_update_token),
+        )
+        .route("/admin/api/tokens/{id}/rotate", post(admin_rotate_token))
         .route("/admin/api/tokens/{id}/reveal", get(admin_reveal_token))
         .route("/admin/api/stats", get(admin_stats))
 }
 
 // ── Admin Auth ──
 
+fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get("cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(';').find_map(|part| {
+                let part = part.trim();
+                let (cookie_name, cookie_value) = part.split_once('=')?;
+                (cookie_name == name).then(|| cookie_value.to_string())
+            })
+        })
+}
+
+fn extract_admin_token(headers: &HeaderMap) -> Option<String> {
+    extract_cookie(headers, ADMIN_COOKIE_NAME).or_else(|| {
+        headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|v| v.trim().to_string())
+    })
+}
+
+fn build_admin_session_cookie(token: &str, secure: bool) -> String {
+    format!(
+        "{ADMIN_COOKIE_NAME}={token}; HttpOnly; Max-Age=86400; Path={ADMIN_COOKIE_PATH}; SameSite=Strict{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+fn clear_admin_session_cookie(secure: bool) -> String {
+    format!(
+        "{ADMIN_COOKIE_NAME}=; HttpOnly; Max-Age=0; Path={ADMIN_COOKIE_PATH}; SameSite=Strict; Expires=Thu, 01 Jan 1970 00:00:00 GMT{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+
 fn verify_admin(headers: &HeaderMap, state: &AppState) -> Result<(), AppError> {
     if state.admin_password_hash.is_none() {
         return Err(AppError::NotFound("Admin panel disabled".to_string()));
     }
 
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| AppError::Unauthorized("Missing admin token".to_string()))?;
+    let token = extract_admin_token(headers)
+        .ok_or_else(|| AppError::Unauthorized("Missing admin session".to_string()))?;
 
-    // Use independent JWT secret, not the bcrypt hash
     auth::validate_admin_jwt(token.trim(), &state.jwt_secret)
-        .map_err(|_| AppError::Unauthorized("Invalid or expired admin token".to_string()))?;
+        .map_err(|_| AppError::Unauthorized("Invalid or expired admin session".to_string()))?;
 
+    Ok(())
+}
+
+fn normalize_optional_timestamp(value: Option<String>) -> Result<Option<String>, AppError> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value.trim())
+                .map(|dt| dt.with_timezone(&chrono::Utc).to_rfc3339())
+                .map_err(|_| {
+                    AppError::BadRequest("Timestamp must be valid RFC3339 / ISO-8601".to_string())
+                })
+        })
+        .transpose()
+}
+
+fn effective_token_expiry(
+    state: &AppState,
+    requested: Option<String>,
+) -> Result<Option<String>, AppError> {
+    if let Some(expires_at) = normalize_optional_timestamp(requested)? {
+        return Ok(Some(expires_at));
+    }
+    Ok(state
+        .default_token_ttl_seconds
+        .map(|ttl| (chrono::Utc::now() + chrono::Duration::seconds(ttl)).to_rfc3339()))
+}
+
+fn token_expired(token: &ApiToken) -> bool {
+    token.expires_at.as_deref().is_some_and(|expires_at| {
+        chrono::DateTime::parse_from_rfc3339(expires_at)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc) <= chrono::Utc::now())
+            .unwrap_or(false)
+    })
+}
+
+fn serialize_token_summary(token: &ApiToken) -> serde_json::Value {
+    json!({
+        "id": token.id,
+        "name": token.name,
+        "canReveal": token.encrypted_token.is_some(),
+        "namespacePattern": token.namespace_pattern,
+        "permissions": token.permissions,
+        "createdAt": token.created_at,
+        "lastUsedAt": token.last_used_at,
+        "enabled": token.enabled,
+        "expiresAt": token.expires_at,
+        "rotatedAt": token.rotated_at,
+        "disabledAt": token.disabled_at,
+        "expired": token_expired(token),
+    })
+}
+
+fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, state: &AppState) -> IpAddr {
+    if !state.trust_proxy_headers {
+        return peer_ip;
+    }
+
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::trim)
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .unwrap_or(peer_ip)
+}
+
+fn ensure_login_allowed(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+    let now = chrono::Utc::now();
+    state
+        .db
+        .cleanup_login_attempts(now, state.login_window_seconds)?;
+
+    let ip_key = ip.to_string();
+    if let Some(attempt) = state.db.get_login_attempt(&ip_key)? {
+        if let Some(blocked_until) = attempt
+            .blocked_until
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+        {
+            if blocked_until > now {
+                let retry_after = blocked_until.signed_duration_since(now).num_seconds();
+                tracing::warn!(
+                    target: "audit",
+                    event = "admin_login_blocked",
+                    client_ip = %ip,
+                    retry_after_seconds = retry_after.max(1),
+                    "Admin login blocked by rate limiter"
+                );
+                return Err(AppError::TooManyRequests(format!(
+                    "Too many login attempts. Retry in {} seconds",
+                    retry_after.max(1)
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn record_login_failure(state: &AppState, ip: IpAddr) -> Result<LoginAttemptRecord, AppError> {
+    let now = chrono::Utc::now();
+    let ip_key = ip.to_string();
+    let mut attempt = state
+        .db
+        .get_login_attempt(&ip_key)?
+        .unwrap_or(LoginAttemptRecord {
+            first_failure_at: now.to_rfc3339(),
+            failures: 0,
+            blocked_until: None,
+        });
+
+    let first_failure_at = chrono::DateTime::parse_from_rfc3339(&attempt.first_failure_at)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    if first_failure_at.is_none()
+        || now
+            .signed_duration_since(first_failure_at.unwrap())
+            .num_seconds()
+            > state.login_window_seconds
+    {
+        attempt.first_failure_at = now.to_rfc3339();
+        attempt.failures = 0;
+        attempt.blocked_until = None;
+    }
+
+    attempt.failures += 1;
+    if attempt.failures >= state.max_login_failures {
+        attempt.blocked_until =
+            Some((now + chrono::Duration::seconds(state.login_lockout_seconds)).to_rfc3339());
+    }
+    state.db.set_login_attempt(&ip_key, &attempt)?;
+
+    tracing::warn!(
+        target: "audit",
+        event = "admin_login_failed",
+        client_ip = %ip,
+        failures = attempt.failures,
+        blocked_until = attempt.blocked_until.as_deref().unwrap_or(""),
+        "Admin login failed"
+    );
+
+    Ok(attempt)
+}
+
+fn clear_login_failures(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
+    state.db.delete_login_attempt(&ip.to_string())?;
     Ok(())
 }
 
@@ -103,7 +294,7 @@ async fn admin_login(
         .ok_or_else(|| AppError::NotFound("Admin panel disabled".to_string()))?;
 
     if !auth::verify_admin_password(&body.password, hash) {
-        record_login_failure(&state, client_ip)?;
+        let _ = record_login_failure(&state, client_ip)?;
         return Err(AppError::Unauthorized("Invalid password".to_string()));
     }
 
@@ -111,27 +302,33 @@ async fn admin_login(
 
     let jwt = auth::create_admin_jwt(&state.jwt_secret)
         .map_err(|e| AppError::Internal(format!("JWT creation failed: {e}")))?;
+    let cookie = build_admin_session_cookie(&jwt, state.admin_cookie_secure);
 
-    Ok(Json(json!({ "token": jwt })))
+    tracing::info!(
+        target: "audit",
+        event = "admin_login_succeeded",
+        client_ip = %client_ip,
+        "Admin login succeeded"
+    );
+
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        "set-cookie",
+        HeaderValue::from_str(&cookie)
+            .map_err(|e| AppError::Internal(format!("Invalid session cookie: {e}")))?,
+    );
+    Ok((response_headers, Json(json!({ "ok": true }))))
 }
 
-fn resolve_client_ip(headers: &HeaderMap, peer_ip: IpAddr, state: &AppState) -> IpAddr {
-    if !state.trust_proxy_headers {
-        return peer_ip;
-    }
-
-    headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|value| value.to_str().ok())
-        })
-        .map(str::trim)
-        .and_then(|value| value.parse::<IpAddr>().ok())
-        .unwrap_or(peer_ip)
+async fn admin_logout(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, AppError> {
+    let mut response_headers = HeaderMap::new();
+    let cookie = clear_admin_session_cookie(state.admin_cookie_secure);
+    response_headers.insert(
+        "set-cookie",
+        HeaderValue::from_str(&cookie)
+            .map_err(|e| AppError::Internal(format!("Invalid clear cookie: {e}")))?,
+    );
+    Ok((response_headers, Json(json!({ "ok": true }))))
 }
 
 // ── GET /admin/api/namespaces ──
@@ -142,10 +339,9 @@ async fn admin_list_namespaces(
 ) -> Result<impl IntoResponse, AppError> {
     verify_admin(&headers, &state)?;
 
-    let namespaces = state.db.list_namespaces()?;
     let mut infos = Vec::new();
 
-    for ns in namespaces {
+    for ns in state.db.list_namespaces()? {
         let meta = state
             .db
             .get_metadata(&ns)?
@@ -160,9 +356,30 @@ async fn admin_list_namespaces(
             blob_size: meta.as_ref().map(|m| m.content_length).unwrap_or(0),
             object_count: obj_count,
             format: meta.as_ref().and_then(|m| m.format.clone()),
+            deleted_at: None,
         });
     }
 
+    for (ns, deleted) in state.db.list_deleted_namespaces()? {
+        let meta = state
+            .db
+            .get_metadata(&ns)?
+            .and_then(|d| serde_json::from_slice::<SyncMetadata>(&d).ok());
+        let obj_count = state.db.count_objects(&ns)?;
+
+        infos.push(NamespaceInfo {
+            namespace: ns,
+            revision: meta.as_ref().and_then(|m| m.revision.clone()),
+            uploaded_at: meta.as_ref().and_then(|m| m.uploaded_at.clone()),
+            device_id: meta.as_ref().and_then(|m| m.device_id.clone()),
+            blob_size: meta.as_ref().map(|m| m.content_length).unwrap_or(0),
+            object_count: obj_count,
+            format: meta.as_ref().and_then(|m| m.format.clone()),
+            deleted_at: Some(deleted.deleted_at),
+        });
+    }
+
+    infos.sort_by(|a, b| a.namespace.cmp(&b.namespace));
     Ok(Json(infos))
 }
 
@@ -176,14 +393,21 @@ struct CreateNamespaceRequest {
 async fn admin_create_namespace(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateNamespaceRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     verify_admin(&headers, &state)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
 
     let namespace = body.namespace.trim().to_string();
     crate::api::validate_namespace(&namespace)?;
 
-    // Check if namespace already exists
+    if state.db.is_namespace_deleted(&namespace)? {
+        return Err(AppError::BadRequest(format!(
+            "Namespace '{}' is soft-deleted. Restore or purge it first.",
+            namespace
+        )));
+    }
     if state.db.get_metadata(&namespace)?.is_some() {
         return Err(AppError::BadRequest(format!(
             "Namespace '{}' already exists",
@@ -191,54 +415,109 @@ async fn admin_create_namespace(
         )));
     }
 
-    // Write empty metadata to create the namespace
     let meta = SyncMetadata::empty();
     let serialized = serde_json::to_vec(&meta)
         .map_err(|e| AppError::Internal(format!("Failed to serialize metadata: {e}")))?;
     state.db.set_metadata(&namespace, &serialized)?;
+
+    tracing::info!(
+        target: "audit",
+        event = "namespace_created",
+        client_ip = %client_ip,
+        namespace = %namespace,
+        "Namespace created"
+    );
 
     Ok(Json(json!({ "ok": true, "namespace": namespace })))
 }
 
 // ── DELETE /admin/api/namespaces/:namespace ──
 
+#[derive(Deserialize)]
+struct DeleteNamespaceQuery {
+    hard: Option<bool>,
+}
+
 async fn admin_delete_namespace(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(namespace): axum::extract::Path<String>,
+    Query(query): Query<DeleteNamespaceQuery>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<impl IntoResponse, AppError> {
     verify_admin(&headers, &state)?;
-    state.db.delete_namespace(&namespace)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
+    let hard = query.hard.unwrap_or(false);
+
+    if hard {
+        state.db.hard_delete_namespace(&namespace)?;
+        tracing::info!(
+            target: "audit",
+            event = "namespace_hard_deleted",
+            client_ip = %client_ip,
+            namespace = %namespace,
+            "Namespace permanently deleted"
+        );
+        return Ok(Json(json!({ "ok": true, "mode": "hard" })));
+    }
+
+    if state.db.is_namespace_deleted(&namespace)? {
+        return Err(AppError::BadRequest(format!(
+            "Namespace '{}' is already soft-deleted",
+            namespace
+        )));
+    }
+    if state.db.get_metadata(&namespace)?.is_none() {
+        return Err(AppError::NotFound(format!(
+            "Namespace '{}' not found",
+            namespace
+        )));
+    }
+
+    state
+        .db
+        .soft_delete_namespace(&namespace, &chrono::Utc::now().to_rfc3339())?;
+
+    tracing::info!(
+        target: "audit",
+        event = "namespace_soft_deleted",
+        client_ip = %client_ip,
+        namespace = %namespace,
+        "Namespace soft-deleted"
+    );
+
+    Ok(Json(json!({ "ok": true, "mode": "soft" })))
+}
+
+async fn admin_restore_namespace(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(namespace): axum::extract::Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, AppError> {
+    verify_admin(&headers, &state)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
+
+    if !state.db.is_namespace_deleted(&namespace)? {
+        return Err(AppError::NotFound(format!(
+            "Namespace '{}' is not soft-deleted",
+            namespace
+        )));
+    }
+    state.db.restore_namespace(&namespace)?;
+
+    tracing::info!(
+        target: "audit",
+        event = "namespace_restored",
+        client_ip = %client_ip,
+        namespace = %namespace,
+        "Namespace restored"
+    );
+
     Ok(Json(json!({ "ok": true })))
 }
 
-// ── GET /admin/api/tokens ──
-
-async fn admin_list_tokens(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, AppError> {
-    verify_admin(&headers, &state)?;
-    let tokens = state.db.get_all_tokens()?;
-    // Return tokens without the hash
-    let safe_tokens: Vec<serde_json::Value> = tokens
-        .iter()
-        .map(|t| {
-            json!({
-                "id": t.id,
-                "name": t.name,
-                "canReveal": t.encrypted_token.is_some(),
-                "namespacePattern": t.namespace_pattern,
-                "permissions": t.permissions,
-                "createdAt": t.created_at,
-                "lastUsedAt": t.last_used_at,
-            })
-        })
-        .collect();
-    Ok(Json(safe_tokens))
-}
-
-// ── POST /admin/api/tokens ──
+// ── Tokens ──
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -246,16 +525,35 @@ struct CreateTokenRequest {
     name: String,
     namespace_pattern: String,
     permissions: Option<Vec<String>>,
+    expires_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTokenRequest {
+    enabled: Option<bool>,
+    expires_at: Option<Option<String>>,
+}
+
+async fn admin_list_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    verify_admin(&headers, &state)?;
+    let tokens = state.db.get_all_tokens()?;
+    let safe_tokens: Vec<serde_json::Value> = tokens.iter().map(serialize_token_summary).collect();
+    Ok(Json(safe_tokens))
 }
 
 async fn admin_create_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<CreateTokenRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     verify_admin(&headers, &state)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
 
-    // Validate namespace pattern
     if !auth::validate_namespace_pattern(&body.namespace_pattern) {
         return Err(AppError::BadRequest(
             "Namespace pattern must be '*' , an exact namespace, or a prefix ending with '*'"
@@ -273,13 +571,13 @@ async fn admin_create_token(
         ));
     }
 
-    // Generate a secure random token
     let raw_token = uuid::Uuid::new_v4().to_string();
     let token_hash = auth::hash_api_token(&raw_token);
     let encrypted_token = crypto::encrypt(&state.token_reveal_key, raw_token.as_bytes())
         .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
         .map_err(|e| AppError::Internal(format!("Token encryption failed: {e}")))?;
     let id = uuid::Uuid::new_v4().to_string();
+    let expires_at = effective_token_expiry(&state, body.expires_at)?;
 
     let token = ApiToken {
         id: id.clone(),
@@ -289,12 +587,26 @@ async fn admin_create_token(
         namespace_pattern: body.namespace_pattern,
         permissions,
         created_at: chrono::Utc::now().to_rfc3339(),
+        enabled: true,
+        expires_at,
+        rotated_at: None,
+        disabled_at: None,
         last_used_at: None,
     };
 
     state.db.set_token(&token)?;
 
-    // Return the raw token immediately so the user can copy it without an extra reveal roundtrip.
+    tracing::info!(
+        target: "audit",
+        event = "token_created",
+        client_ip = %client_ip,
+        token_id = %id,
+        namespace_pattern = %token.namespace_pattern,
+        permissions = %token.permissions.join(","),
+        expires_at = token.expires_at.as_deref().unwrap_or(""),
+        "API token created"
+    );
+
     Ok(Json(json!({
         "id": id,
         "token": raw_token,
@@ -302,22 +614,105 @@ async fn admin_create_token(
         "namespacePattern": token.namespace_pattern,
         "permissions": token.permissions,
         "createdAt": token.created_at,
+        "expiresAt": token.expires_at,
     })))
 }
 
-// ── GET /admin/api/tokens/:id/reveal ──
+async fn admin_update_token(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<UpdateTokenRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    verify_admin(&headers, &state)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
+
+    let mut token = state
+        .db
+        .get_token(&id)?
+        .ok_or_else(|| AppError::NotFound(format!("Token '{}' not found", id)))?;
+
+    if let Some(enabled) = body.enabled {
+        token.enabled = enabled;
+        token.disabled_at = if enabled {
+            None
+        } else {
+            Some(chrono::Utc::now().to_rfc3339())
+        };
+    }
+    if let Some(expires_at) = body.expires_at {
+        token.expires_at = normalize_optional_timestamp(expires_at)?;
+    }
+
+    state.db.set_token(&token)?;
+
+    tracing::info!(
+        target: "audit",
+        event = "token_updated",
+        client_ip = %client_ip,
+        token_id = %token.id,
+        enabled = token.enabled,
+        expires_at = token.expires_at.as_deref().unwrap_or(""),
+        "API token updated"
+    );
+
+    Ok(Json(serialize_token_summary(&token)))
+}
+
+async fn admin_rotate_token(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, AppError> {
+    verify_admin(&headers, &state)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
+
+    let mut token = state
+        .db
+        .get_token(&id)?
+        .ok_or_else(|| AppError::NotFound(format!("Token '{}' not found", id)))?;
+
+    let raw_token = uuid::Uuid::new_v4().to_string();
+    token.token_hash = auth::hash_api_token(&raw_token);
+    token.encrypted_token = Some(
+        base64::engine::general_purpose::STANDARD.encode(
+            crypto::encrypt(&state.token_reveal_key, raw_token.as_bytes())
+                .map_err(|e| AppError::Internal(format!("Token encryption failed: {e}")))?,
+        ),
+    );
+    token.rotated_at = Some(chrono::Utc::now().to_rfc3339());
+    state.db.set_token(&token)?;
+
+    tracing::info!(
+        target: "audit",
+        event = "token_rotated",
+        client_ip = %client_ip,
+        token_id = %token.id,
+        "API token rotated"
+    );
+
+    Ok(Json(json!({
+        "id": token.id,
+        "token": raw_token,
+        "rotatedAt": token.rotated_at,
+    })))
+}
 
 async fn admin_reveal_token(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<impl IntoResponse, AppError> {
     verify_admin(&headers, &state)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
 
     let token = state
         .db
         .get_token(&id)?
-        .ok_or_else(|| AppError::NotFound(format!("Token '{id}' not found")))?;
+        .ok_or_else(|| AppError::NotFound(format!("Token '{}' not found", id)))?;
     let encrypted_token = token.encrypted_token.ok_or_else(|| {
         AppError::BadRequest(
             "This token was created before reveal support and cannot be recovered. Create a new token to enable reveal.".to_string(),
@@ -339,6 +734,14 @@ async fn admin_reveal_token(
             })
         })?;
 
+    tracing::info!(
+        target: "audit",
+        event = "token_revealed",
+        client_ip = %client_ip,
+        token_id = %token.id,
+        "API token revealed"
+    );
+
     Ok(Json(json!({
         "id": token.id,
         "token": raw_token,
@@ -346,81 +749,25 @@ async fn admin_reveal_token(
     })))
 }
 
-fn ensure_login_allowed(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
-    let now = Instant::now();
-    let mut attempts = state
-        .login_attempts
-        .lock()
-        .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
-
-    attempts.retain(|_, attempt| {
-        if let Some(blocked_until) = attempt.blocked_until {
-            blocked_until > now
-        } else {
-            now.duration_since(attempt.first_failure_at) <= LOGIN_WINDOW
-        }
-    });
-
-    if let Some(attempt) = attempts.get(&ip) {
-        if let Some(blocked_until) = attempt.blocked_until {
-            if blocked_until > now {
-                let retry_after = blocked_until.duration_since(now).as_secs();
-                return Err(AppError::TooManyRequests(format!(
-                    "Too many login attempts. Retry in {} seconds",
-                    retry_after.max(1)
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn record_login_failure(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
-    let now = Instant::now();
-    let mut attempts = state
-        .login_attempts
-        .lock()
-        .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
-
-    let attempt = attempts.entry(ip).or_insert(crate::api::LoginAttemptState {
-        first_failure_at: now,
-        failures: 0,
-        blocked_until: None,
-    });
-
-    if now.duration_since(attempt.first_failure_at) > LOGIN_WINDOW {
-        attempt.first_failure_at = now;
-        attempt.failures = 0;
-        attempt.blocked_until = None;
-    }
-
-    attempt.failures += 1;
-    if attempt.failures >= MAX_LOGIN_FAILURES {
-        attempt.blocked_until = Some(now + LOGIN_LOCKOUT);
-    }
-
-    Ok(())
-}
-
-fn clear_login_failures(state: &AppState, ip: IpAddr) -> Result<(), AppError> {
-    let mut attempts = state
-        .login_attempts
-        .lock()
-        .map_err(|_| AppError::Internal("Login rate limiter lock poisoned".to_string()))?;
-    attempts.remove(&ip);
-    Ok(())
-}
-
-// ── DELETE /admin/api/tokens/:id ──
-
 async fn admin_delete_token(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<impl IntoResponse, AppError> {
     verify_admin(&headers, &state)?;
+    let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
+
     state.db.delete_token(&id)?;
+
+    tracing::info!(
+        target: "audit",
+        event = "token_deleted",
+        client_ip = %client_ip,
+        token_id = %id,
+        "API token deleted"
+    );
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -433,14 +780,40 @@ async fn admin_stats(
     verify_admin(&headers, &state)?;
 
     let namespaces = state.db.list_namespaces()?;
+    let deleted_namespaces = state.db.list_deleted_namespaces()?;
     let tokens = state.db.get_all_tokens()?;
     let encrypted = state.encryption_key.is_some();
+    let db_writable = state.db.check_writable().is_ok();
+    let db_size_bytes = std::fs::metadata(&state.db_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let disabled_tokens = tokens.iter().filter(|token| !token.enabled).count();
+    let expired_tokens = tokens.iter().filter(|token| token_expired(token)).count();
 
     Ok(Json(json!({
         "namespaceCount": namespaces.len(),
+        "deletedNamespaceCount": deleted_namespaces.len(),
         "tokenCount": tokens.len(),
+        "disabledTokenCount": disabled_tokens,
+        "expiredTokenCount": expired_tokens,
         "encryptionEnabled": encrypted,
         "tokenRevealPersistent": state.token_reveal_persistent,
+        "jwtSecretPersistent": state.admin_jwt_secret_persistent,
+        "adminCookieSecure": state.admin_cookie_secure,
+        "dbWritable": db_writable,
+        "dbSizeBytes": db_size_bytes,
+        "syncCorsOrigins": state.sync_cors_allowed_origins,
+        "defaultTokenTtlSeconds": state.default_token_ttl_seconds,
+        "loginWindowSeconds": state.login_window_seconds,
+        "loginLockoutSeconds": state.login_lockout_seconds,
+        "maxLoginFailures": state.max_login_failures,
+        "metadataRetention": {
+            "storeRevision": state.metadata_retention.store_revision,
+            "storeUploadedAt": state.metadata_retention.store_uploaded_at,
+            "storeDeviceId": state.metadata_retention.store_device_id,
+            "storeContentHash": state.metadata_retention.store_content_hash,
+        },
         "version": env!("CARGO_PKG_VERSION"),
     })))
 }
@@ -487,7 +860,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     color: var(--ot-text-primary);
     min-height: 100vh;
   }
-  .container { max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem; }
+  .container { max-width: 1120px; margin: 0 auto; padding: 2rem 1.5rem; }
   h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; }
   .subtitle { color: var(--ot-text-muted); font-size: 0.875rem; margin-bottom: 2rem; }
   .card {
@@ -529,9 +902,15 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
+  .status-strip {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-top: 1rem;
+  }
   table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
   th { text-align: left; padding: 0.5rem; color: var(--ot-text-muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--ot-border); }
-  td { padding: 0.625rem 0.5rem; border-bottom: 1px solid var(--ot-border); }
+  td { padding: 0.625rem 0.5rem; border-bottom: 1px solid var(--ot-border); vertical-align: top; }
   tr:last-child td { border-bottom: none; }
   .mono { font-family: var(--font-mono); font-size: 0.8125rem; }
   .badge {
@@ -561,6 +940,8 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     font-family: inherit;
     cursor: pointer;
     transition: all 0.15s;
+    margin-right: 0.25rem;
+    margin-bottom: 0.25rem;
   }
   .btn:hover { background: var(--ot-bg-elevated); }
   .btn-primary {
@@ -572,7 +953,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
   .btn-danger { color: var(--ot-red); }
   .btn-danger:hover { background: #f8d7da; }
   .btn-sm { padding: 0.25rem 0.625rem; font-size: 0.75rem; }
-  input[type="text"], input[type="password"] {
+  input[type="text"], input[type="password"], input[type="datetime-local"] {
     width: 100%;
     padding: 0.5rem 0.75rem;
     border: 1px solid var(--ot-border);
@@ -640,8 +1021,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
 </head>
 <body>
 
-<!-- Login Screen -->
-<div id="login-screen" class="login-wrapper">
+<div id="login-screen" class="login-wrapper hidden">
   <div class="login-card">
     <h1>OxideTerm Sync</h1>
     <p class="subtitle">Admin Panel</p>
@@ -656,7 +1036,6 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Dashboard -->
 <div id="dashboard" class="container hidden">
   <div class="header">
     <div class="header-left">
@@ -666,7 +1045,6 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     <button class="btn btn-sm" onclick="logout()">Sign Out</button>
   </div>
 
-  <!-- Stats -->
   <div class="card">
     <h2>Overview</h2>
     <div class="stats-grid">
@@ -675,21 +1053,29 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
         <div class="stat-label">Namespaces</div>
       </div>
       <div class="stat-item">
+        <div class="stat-value" id="stat-deleted-namespaces">-</div>
+        <div class="stat-label">Soft Deleted</div>
+      </div>
+      <div class="stat-item">
         <div class="stat-value" id="stat-tokens">-</div>
         <div class="stat-label">API Tokens</div>
       </div>
       <div class="stat-item">
-        <div class="stat-value" id="stat-encryption">-</div>
-        <div class="stat-label">Encryption</div>
+        <div class="stat-value" id="stat-disabled-tokens">-</div>
+        <div class="stat-label">Disabled Tokens</div>
+      </div>
+      <div class="stat-item">
+        <div class="stat-value" id="stat-ready">-</div>
+        <div class="stat-label">DB Writable</div>
       </div>
       <div class="stat-item">
         <div class="stat-value" id="stat-version">-</div>
         <div class="stat-label">Version</div>
       </div>
     </div>
+    <div class="status-strip" id="status-strip"></div>
   </div>
 
-  <!-- API Tokens -->
   <div class="card">
     <div class="flex-between mb-1">
       <h2>API Tokens</h2>
@@ -705,18 +1091,21 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
           <label>Namespace Pattern</label>
           <input type="text" id="token-ns" placeholder="* or my-namespace">
         </div>
+        <div class="form-group">
+          <label>Expires At (optional)</label>
+          <input type="datetime-local" id="token-expiry">
+        </div>
       </div>
       <button class="btn btn-primary btn-sm" onclick="createToken()">Generate</button>
       <button class="btn btn-sm" onclick="hideCreateToken()">Cancel</button>
     </div>
     <div id="new-token-reveal" class="token-reveal hidden">
-      <div class="label">Copy this token now. You can reveal it again later from this panel while the server keeps its reveal key.</div>
+      <div class="label">Copy this token now. You can reveal or rotate it later from this panel while the server keeps its reveal key.</div>
       <div class="value" id="new-token-value"></div>
     </div>
     <div id="tokens-table"></div>
   </div>
 
-  <!-- Namespaces -->
   <div class="card">
     <div class="flex-between mb-1">
       <h2>Namespaces</h2>
@@ -736,33 +1125,47 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
 
 <script>
 const API = '/admin/api';
-let jwt = localStorage.getItem('admin_jwt');
 let tokenRevealPersistent = false;
 const revealedTokens = {};
 
-// ── Init ──
-if (jwt) { showDashboard(); } else { showLogin(); }
+bootstrap();
+
+async function bootstrap() {
+  try {
+    const res = await api('/stats', { allowUnauthorized: true });
+    if (res.ok) {
+      showDashboard();
+      await loadAll();
+      return;
+    }
+  } catch {}
+  showLogin();
+}
 
 function showLogin() {
   document.getElementById('login-screen').classList.remove('hidden');
   document.getElementById('dashboard').classList.add('hidden');
 }
 
-async function showDashboard() {
+function showDashboard() {
   document.getElementById('login-screen').classList.add('hidden');
   document.getElementById('dashboard').classList.remove('hidden');
-  await loadStats();
-  await loadTokens();
-  loadNamespaces();
 }
 
-function logout() {
-  jwt = null;
-  localStorage.removeItem('admin_jwt');
+async function loadAll() {
+  await loadStats();
+  await loadTokens();
+  await loadNamespaces();
+}
+
+async function logout() {
+  try {
+    await fetch(`${API}/logout`, { method: 'POST', credentials: 'same-origin' });
+  } catch {}
+  Object.keys(revealedTokens).forEach((key) => delete revealedTokens[key]);
   showLogin();
 }
 
-// ── Login ──
 document.getElementById('login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const pw = document.getElementById('password').value;
@@ -772,6 +1175,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     const res = await fetch(`${API}/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
       body: JSON.stringify({ password: pw }),
     });
     if (!res.ok) {
@@ -780,63 +1184,83 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
       errEl.classList.remove('hidden');
       return;
     }
-    const data = await res.json();
-    jwt = data.token;
-    localStorage.setItem('admin_jwt', jwt);
-    await showDashboard();
-  } catch (err) {
+    document.getElementById('password').value = '';
+    showDashboard();
+    await loadAll();
+  } catch {
     errEl.textContent = 'Network error';
     errEl.classList.remove('hidden');
   }
 });
 
-// ── API Helper ──
 async function api(path, opts = {}) {
+  const { allowUnauthorized, ...rest } = opts;
   const res = await fetch(`${API}${path}`, {
-    ...opts,
-    headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json', ...opts.headers },
+    credentials: 'same-origin',
+    ...rest,
+    headers: { 'Content-Type': 'application/json', ...rest.headers },
   });
-  if (res.status === 401) { logout(); throw new Error('Session expired'); }
+  if (res.status === 401 && !allowUnauthorized) {
+    showLogin();
+  }
   return res;
 }
 
-// ── Stats ──
 async function loadStats() {
-  try {
-    const res = await api('/stats');
-    const d = await res.json();
-    document.getElementById('stat-namespaces').textContent = d.namespaceCount;
-    document.getElementById('stat-tokens').textContent = d.tokenCount;
-    document.getElementById('stat-encryption').textContent = d.encryptionEnabled ? 'ON' : 'OFF';
-    document.getElementById('stat-version').textContent = 'v' + d.version;
-    tokenRevealPersistent = !!d.tokenRevealPersistent;
-  } catch {}
+  const res = await api('/stats');
+  if (!res.ok) return;
+  const d = await res.json();
+  document.getElementById('stat-namespaces').textContent = d.namespaceCount;
+  document.getElementById('stat-deleted-namespaces').textContent = d.deletedNamespaceCount;
+  document.getElementById('stat-tokens').textContent = d.tokenCount;
+  document.getElementById('stat-disabled-tokens').textContent = d.disabledTokenCount;
+  document.getElementById('stat-ready').textContent = d.dbWritable ? 'YES' : 'NO';
+  document.getElementById('stat-version').textContent = 'v' + d.version;
+  tokenRevealPersistent = !!d.tokenRevealPersistent;
+  const strip = document.getElementById('status-strip');
+  strip.innerHTML = [
+    badge(d.encryptionEnabled ? 'At-rest encryption' : 'Plaintext storage', d.encryptionEnabled ? 'green' : 'red'),
+    badge(d.jwtSecretPersistent ? 'Persistent JWT secret' : 'Ephemeral JWT secret', d.jwtSecretPersistent ? 'green' : 'red'),
+    badge(d.adminCookieSecure ? 'Secure admin cookie' : 'Insecure admin cookie', d.adminCookieSecure ? 'green' : 'red'),
+    badge(d.syncCorsOrigins.length ? `CORS: ${d.syncCorsOrigins.join(', ')}` : 'CORS disabled', d.syncCorsOrigins.length ? 'green' : 'muted'),
+    badge(`Expired tokens: ${d.expiredTokenCount}`, d.expiredTokenCount ? 'red' : 'green'),
+    badge(`DB size: ${formatBytes(d.dbSizeBytes)}`, 'muted'),
+  ].join('');
 }
 
-// ── Tokens ──
 async function loadTokens() {
-  try {
-    const res = await api('/tokens');
-    const tokens = await res.json();
-    const el = document.getElementById('tokens-table');
-    if (!tokens.length) {
-      el.innerHTML = '<div class="empty-state">No API tokens. Create one to get started.</div>';
-      return;
-    }
-    el.innerHTML = `<table>
-      <thead><tr><th>Name</th><th>Namespace</th><th>Token</th><th>Created</th><th></th></tr></thead>
-      <tbody>${tokens.map(t => `<tr>
-        <td>${esc(t.name)}</td>
-        <td class="mono">${esc(t.namespacePattern)}</td>
-        <td>${renderTokenCell(t)}</td>
-        <td>${new Date(t.createdAt).toLocaleDateString()}</td>
-        <td>
-          ${t.canReveal ? `<button class="btn btn-sm" onclick="toggleTokenReveal('${t.id}')">${revealedTokens[t.id] ? 'Hide' : 'Show'}</button>` : `<span class="badge badge-red">Legacy</span>`}
-          <button class="btn btn-danger btn-sm" onclick="deleteToken('${t.id}')">Delete</button>
-        </td>
-      </tr>`).join('')}</tbody>
-    </table>`;
-  } catch {}
+  const res = await api('/tokens');
+  if (!res.ok) return;
+  const tokens = await res.json();
+  const el = document.getElementById('tokens-table');
+  if (!tokens.length) {
+    el.innerHTML = '<div class="empty-state">No API tokens. Create one to get started.</div>';
+    return;
+  }
+  el.innerHTML = `<table>
+    <thead><tr><th>Name</th><th>Status</th><th>Namespace</th><th>Expires</th><th>Token</th><th>Last Used</th><th>Actions</th></tr></thead>
+    <tbody>${tokens.map(t => `<tr>
+      <td>${esc(t.name)}</td>
+      <td>${renderTokenStatus(t)}</td>
+      <td class="mono">${esc(t.namespacePattern)}</td>
+      <td>${t.expiresAt ? new Date(t.expiresAt).toLocaleString() : '-'}</td>
+      <td>${renderTokenCell(t)}</td>
+      <td>${t.lastUsedAt ? new Date(t.lastUsedAt).toLocaleString() : '-'}</td>
+      <td>
+        ${t.canReveal ? `<button class="btn btn-sm" onclick="toggleTokenReveal('${t.id}')">${revealedTokens[t.id] ? 'Hide' : 'Show'}</button>` : `<span class="badge badge-red">Legacy</span>`}
+        <button class="btn btn-sm" onclick="rotateToken('${t.id}')">Rotate</button>
+        <button class="btn btn-sm" onclick="toggleTokenEnabled('${t.id}', ${!t.enabled})">${t.enabled ? 'Disable' : 'Enable'}</button>
+        <button class="btn btn-sm" onclick="editTokenExpiry('${t.id}', ${t.expiresAt ? `'${escJs(t.expiresAt)}'` : 'null'})">Expiry</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteToken('${t.id}')">Delete</button>
+      </td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+
+function renderTokenStatus(token) {
+  if (!token.enabled) return badge('Disabled', 'red');
+  if (token.expired) return badge('Expired', 'red');
+  return badge('Active', 'green');
 }
 
 function renderTokenCell(token) {
@@ -853,6 +1277,7 @@ function showCreateToken() {
   document.getElementById('create-token-form').classList.remove('hidden');
   document.getElementById('new-token-reveal').classList.add('hidden');
 }
+
 function hideCreateToken() {
   document.getElementById('create-token-form').classList.add('hidden');
 }
@@ -860,39 +1285,87 @@ function hideCreateToken() {
 async function createToken() {
   const name = document.getElementById('token-name').value.trim();
   const ns = document.getElementById('token-ns').value.trim() || '*';
+  const expiry = document.getElementById('token-expiry').value;
   if (!name) return;
-  try {
-    const res = await api('/tokens', {
-      method: 'POST',
-      body: JSON.stringify({ name, namespacePattern: ns }),
-    });
-    const data = await res.json();
-    document.getElementById('new-token-value').textContent = data.token;
-    document.getElementById('new-token-reveal').classList.remove('hidden');
-    hideCreateToken();
-    document.getElementById('token-name').value = '';
-    document.getElementById('token-ns').value = '';
-    await loadStats();
-    await loadTokens();
-  } catch {}
+  const expiresAt = expiry ? new Date(expiry).toISOString() : undefined;
+  const res = await api('/tokens', {
+    method: 'POST',
+    body: JSON.stringify({ name, namespacePattern: ns, expiresAt }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to create token');
+    return;
+  }
+  document.getElementById('new-token-value').textContent = data.token;
+  document.getElementById('new-token-reveal').classList.remove('hidden');
+  hideCreateToken();
+  document.getElementById('token-name').value = '';
+  document.getElementById('token-ns').value = '';
+  document.getElementById('token-expiry').value = '';
+  await loadStats();
+  await loadTokens();
 }
 
 async function toggleTokenReveal(id) {
   if (revealedTokens[id]) {
     delete revealedTokens[id];
-    loadTokens();
+    await loadTokens();
     return;
   }
-  try {
-    const res = await api(`/tokens/${id}/reveal`);
-    const data = await res.json();
-    if (!res.ok) {
-      alert(data.error?.message || 'Failed to reveal token');
-      return;
-    }
-    revealedTokens[id] = data.token;
-    loadTokens();
-  } catch {}
+  const res = await api(`/tokens/${id}/reveal`);
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to reveal token');
+    return;
+  }
+  revealedTokens[id] = data.token;
+  await loadTokens();
+}
+
+async function rotateToken(id) {
+  if (!confirm('Rotate this token now? Existing clients will need the new token.')) return;
+  const res = await api(`/tokens/${id}/rotate`, { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to rotate token');
+    return;
+  }
+  revealedTokens[id] = data.token;
+  document.getElementById('new-token-value').textContent = data.token;
+  document.getElementById('new-token-reveal').classList.remove('hidden');
+  await loadTokens();
+}
+
+async function toggleTokenEnabled(id, enabled) {
+  const res = await api(`/tokens/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to update token');
+    return;
+  }
+  await loadStats();
+  await loadTokens();
+}
+
+async function editTokenExpiry(id, currentExpiresAt) {
+  const input = prompt('Enter a new ISO timestamp (leave blank to clear expiry).', currentExpiresAt || '');
+  if (input === null) return;
+  const expiresAt = input.trim() ? input.trim() : null;
+  const res = await api(`/tokens/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ expiresAt }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to update expiry');
+    return;
+  }
+  await loadStats();
+  await loadTokens();
 }
 
 async function copyToken(id) {
@@ -905,49 +1378,82 @@ async function copyToken(id) {
 
 async function deleteToken(id) {
   if (!confirm('Delete this token? Clients using it will lose access.')) return;
-  try {
-    await api(`/tokens/${id}`, { method: 'DELETE' });
-    delete revealedTokens[id];
-    await loadStats();
-    await loadTokens();
-  } catch {}
+  const res = await api(`/tokens/${id}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const data = await res.json();
+    alert(data.error?.message || 'Failed to delete token');
+    return;
+  }
+  delete revealedTokens[id];
+  await loadStats();
+  await loadTokens();
 }
 
-// ── Namespaces ──
 async function loadNamespaces() {
-  try {
-    const res = await api('/namespaces');
-    const nss = await res.json();
-    const el = document.getElementById('namespaces-table');
-    if (!nss.length) {
-      el.innerHTML = '<div class="empty-state">No synced namespaces yet.</div>';
-      return;
-    }
-    el.innerHTML = `<table>
-      <thead><tr><th>Namespace</th><th>Format</th><th>Objects</th><th>Last Sync</th><th></th></tr></thead>
-      <tbody>${nss.map(n => `<tr>
-        <td class="mono">${esc(n.namespace)}</td>
-        <td><span class="badge ${n.format ? 'badge-green' : 'badge-muted'}">${n.format || 'legacy'}</span></td>
-        <td>${n.objectCount}</td>
-        <td>${n.uploadedAt ? new Date(n.uploadedAt).toLocaleString() : '-'}</td>
-        <td><button class="btn btn-danger btn-sm" onclick="deleteNs('${esc(n.namespace)}')">Delete</button></td>
-      </tr>`).join('')}</tbody>
-    </table>`;
-  } catch {}
+  const res = await api('/namespaces');
+  if (!res.ok) return;
+  const nss = await res.json();
+  const el = document.getElementById('namespaces-table');
+  if (!nss.length) {
+    el.innerHTML = '<div class="empty-state">No namespaces yet.</div>';
+    return;
+  }
+  el.innerHTML = `<table>
+    <thead><tr><th>Namespace</th><th>Status</th><th>Format</th><th>Objects</th><th>Last Sync</th><th>Actions</th></tr></thead>
+    <tbody>${nss.map(n => `<tr>
+      <td class="mono">${esc(n.namespace)}</td>
+      <td>${n.deletedAt ? badge('Soft deleted', 'red') : badge('Active', 'green')}</td>
+      <td><span class="badge ${n.format ? 'badge-green' : 'badge-muted'}">${n.format || 'legacy'}</span></td>
+      <td>${n.objectCount}</td>
+      <td>${n.uploadedAt ? new Date(n.uploadedAt).toLocaleString() : '-'}</td>
+      <td>
+        ${n.deletedAt
+          ? `<button class="btn btn-sm" onclick="restoreNs('${escJs(n.namespace)}')">Restore</button><button class="btn btn-danger btn-sm" onclick="purgeNs('${escJs(n.namespace)}')">Purge</button>`
+          : `<button class="btn btn-danger btn-sm" onclick="softDeleteNs('${escJs(n.namespace)}')">Soft Delete</button>`}
+      </td>
+    </tr>`).join('')}</tbody>
+  </table>`;
 }
 
-async function deleteNs(ns) {
-  if (!confirm(`Delete namespace "${ns}" and all its data? This cannot be undone.`)) return;
-  try {
-    await api(`/namespaces/${encodeURIComponent(ns)}`, { method: 'DELETE' });
-    loadNamespaces();
-    loadStats();
-  } catch {}
+async function softDeleteNs(ns) {
+  if (!confirm(`Soft delete namespace "${ns}"? Sync requests will stop until you restore it.`)) return;
+  const res = await api(`/namespaces/${encodeURIComponent(ns)}`, { method: 'DELETE' });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to soft delete namespace');
+    return;
+  }
+  await loadStats();
+  await loadNamespaces();
+}
+
+async function restoreNs(ns) {
+  const res = await api(`/namespaces/${encodeURIComponent(ns)}/restore`, { method: 'POST' });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to restore namespace');
+    return;
+  }
+  await loadStats();
+  await loadNamespaces();
+}
+
+async function purgeNs(ns) {
+  if (!confirm(`Permanently delete namespace "${ns}" and all retained data? This cannot be undone.`)) return;
+  const res = await api(`/namespaces/${encodeURIComponent(ns)}?hard=true`, { method: 'DELETE' });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to purge namespace');
+    return;
+  }
+  await loadStats();
+  await loadNamespaces();
 }
 
 function showCreateNs() {
   document.getElementById('create-ns-form').classList.remove('hidden');
 }
+
 function hideCreateNs() {
   document.getElementById('create-ns-form').classList.add('hidden');
 }
@@ -955,24 +1461,72 @@ function hideCreateNs() {
 async function createNs() {
   const name = document.getElementById('ns-name').value.trim();
   if (!name) return;
-  try {
-    const res = await api('/namespaces', {
-      method: 'POST',
-      body: JSON.stringify({ namespace: name }),
-    });
-    if (!res.ok) {
-      const data = await res.json();
-      alert(data.error?.message || 'Failed to create namespace');
-      return;
-    }
-    hideCreateNs();
-    document.getElementById('ns-name').value = '';
-    loadNamespaces();
-    loadStats();
-  } catch {}
+  const res = await api('/namespaces', {
+    method: 'POST',
+    body: JSON.stringify({ namespace: name }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.error?.message || 'Failed to create namespace');
+    return;
+  }
+  hideCreateNs();
+  document.getElementById('ns-name').value = '';
+  await loadStats();
+  await loadNamespaces();
 }
 
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/'/g, '&#39;').replace(/"/g, '&quot;'); }
+function badge(text, color) {
+  const cls = color === 'green' ? 'badge badge-green' : color === 'red' ? 'badge badge-red' : 'badge badge-muted';
+  return `<span class="${cls}">${esc(text)}</span>`;
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value.toFixed(value >= 10 || idx === 0 ? 0 : 1)} ${units[idx]}`;
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s ?? '';
+  return d.innerHTML.replace(/'/g, '&#39;').replace(/"/g, '&quot;');
+}
+
+function escJs(s) {
+  return String(s ?? '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
 </script>
 </body>
 </html>"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_extraction_prefers_named_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_static("other=1; admin_session=abc123; theme=dark"),
+        );
+        assert_eq!(
+            extract_cookie(&headers, ADMIN_COOKIE_NAME).as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn normalize_optional_timestamp_accepts_rfc3339() {
+        let normalized =
+            normalize_optional_timestamp(Some("2026-04-23T12:34:56Z".to_string())).unwrap();
+        assert_eq!(normalized.as_deref(), Some("2026-04-23T12:34:56+00:00"));
+    }
+}

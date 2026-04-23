@@ -9,8 +9,9 @@
 - **可选静态数据加密** — 使用 ChaCha20-Poly1305 AEAD，加密密钥由您自行掌控。设置 `ENCRYPTION_KEY` 后，blob 和 object 载荷会在落盘前加密。
 - **结构化同步协议** — 完整支持 OxideTerm Cloud Sync 插件的 `structured-v1` 协议。连接、转发、设置等配置以独立对象存储，支持增量同步。
 - **并发控制** — 基于 ETag 的乐观锁机制覆盖 blob 与 object 上传，防止多设备同时上传时数据丢失。
-- **作用域 API Token** — Token 以 SHA-256 散列后存储，每个 Token 可限定到指定命名空间模式（`*`、精确匹配、`前缀*`）。
-- **管理后台** — 内嵌 SPA 管理面板，支持 Token 和命名空间的增删管理。bcrypt 密码 + JWT 会话保护，并带内存级登录限速。
+- **作用域 API Token** — Token 仍通过 SHA-256 散列校验，同时支持过期时间、启用/禁用、轮换，以及新建 Token 的后台回显。
+- **管理后台** — 内嵌 SPA 管理面板，支持 Token 和命名空间管理。bcrypt 密码 + HttpOnly Cookie 会话保护，并带持久化登录限速与审计日志。
+- **运维控制** — 支持命名空间软删除/恢复、`/ready` 就绪检查，以及 redb 数据库的离线备份/恢复/校验命令。
 - **单文件部署** — Rust + [redb](https://github.com/cberner/redb) 嵌入式数据库。无需 MySQL / PostgreSQL。Docker 镜像约 10 MB。
 
 ## 为什么要自建？
@@ -33,8 +34,10 @@
 export ENCRYPTION_KEY=$(openssl rand -hex 32)
 export ADMIN_PASSWORD=你的安全密码
 export ADMIN_JWT_SECRET=$(openssl rand -hex 32)
+export ADMIN_COOKIE_SECURE=true
 # 仅当可信反向代理会覆盖 X-Forwarded-For / X-Real-IP 时才设为 true
 export TRUST_PROXY_HEADERS=false
+export SYNC_CORS_ALLOWED_ORIGINS=
 
 docker run -d \
   --name oxideterm-cloud-sync \
@@ -43,7 +46,9 @@ docker run -d \
   -e ENCRYPTION_KEY=$ENCRYPTION_KEY \
   -e ADMIN_PASSWORD=$ADMIN_PASSWORD \
   -e ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET \
+  -e ADMIN_COOKIE_SECURE=$ADMIN_COOKIE_SECURE \
   -e TRUST_PROXY_HEADERS=$TRUST_PROXY_HEADERS \
+  -e SYNC_CORS_ALLOWED_ORIGINS=$SYNC_CORS_ALLOWED_ORIGINS \
   ghcr.io/analysedecircuit/oxideterm.cloud-sync-server:0.1.0
 ```
 
@@ -51,7 +56,7 @@ docker run -d \
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入 IMAGE_TAG、ENCRYPTION_KEY、ADMIN_PASSWORD、ADMIN_JWT_SECRET，必要时设置 TRUST_PROXY_HEADERS
+# 编辑 .env，填入 IMAGE_TAG、ENCRYPTION_KEY、ADMIN_PASSWORD、ADMIN_JWT_SECRET，以及需要的安全配置
 docker compose up -d
 ```
 
@@ -69,6 +74,34 @@ cargo build --release
   --admin-jwt-secret $(openssl rand -hex 32)
 ```
 
+### 备份 / 恢复
+
+执行这些命令前请先停止服务，确保数据库文件处于静止状态。
+
+```bash
+# 生成离线备份及其校验文件
+./target/release/oxideterm-cloud-sync-server \
+  --db-path ./data/sync.db \
+  --backup-to ./backups/sync-$(date +%F).redb
+
+# 对照 .sha256 校验备份完整性
+./target/release/oxideterm-cloud-sync-server \
+  --verify-backup ./backups/sync-YYYY-MM-DD.redb
+
+# 从备份恢复数据库
+./target/release/oxideterm-cloud-sync-server \
+  --db-path ./data/sync.db \
+  --restore-from ./backups/sync-YYYY-MM-DD.redb
+```
+
+建议定期做一次恢复演练：
+
+1. 停止服务。
+2. 先对候选备份执行 `--verify-backup`。
+3. 恢复到一个临时 `DB_PATH`。
+4. 让服务指向临时库启动，并确认 `/ready` 返回 `ready`。
+5. 验证通过后再恢复生产库。
+
 ## 配置项
 
 | 环境变量 | 命令行参数 | 默认值 | 说明 |
@@ -78,9 +111,22 @@ cargo build --release
 | `ENCRYPTION_KEY` | `--encryption-key` | *(无)* | 32 字节十六进制加密密钥 |
 | `ADMIN_PASSWORD` | `--admin-password` | *(无)* | 管理面板密码（未设置则禁用面板） |
 | `ADMIN_JWT_SECRET` | `--admin-jwt-secret` | 每次启动随机生成 | 管理面板 JWT 签名密钥 |
+| `ADMIN_COOKIE_SECURE` | `--admin-cookie-secure` | `true` | 是否为管理会话 Cookie 强制加上 `Secure` 标记（仅本地纯 HTTP 调试时建议关闭） |
 | `TRUST_PROXY_HEADERS` | `--trust-proxy-headers` | `false` | 是否信任 `X-Forwarded-For` / `X-Real-IP` 参与登录限速 |
+| `SYNC_CORS_ALLOWED_ORIGINS` | `--sync-cors-allowed-origins` | *(空)* | 同步 API 的 CORS 白名单，逗号分隔；设为 `*` 可放开全部来源 |
 | `MAX_BLOB_SIZE` | `--max-blob-size` | `67108864`（64 MiB） | 最大 blob 上传大小 |
 | `MAX_OBJECT_SIZE` | `--max-object-size` | `16777216`（16 MiB） | 最大对象上传大小 |
+| `LOGIN_WINDOW_SECONDS` | `--login-window-seconds` | `900` | 登录失败统计窗口 |
+| `LOGIN_LOCKOUT_SECONDS` | `--login-lockout-seconds` | `900` | 超过阈值后的临时锁定时长 |
+| `MAX_LOGIN_FAILURES` | `--max-login-failures` | `5` | 触发锁定前允许的最大失败次数 |
+| `DEFAULT_TOKEN_TTL_SECONDS` | `--default-token-ttl-seconds` | *(空)* | 对未显式指定 `expiresAt` 的新 Token 自动套用默认有效期 |
+| `STORE_METADATA_REVISION` | `--store-metadata-revision` | `true` | 是否持久化元数据中的 `revision` |
+| `STORE_METADATA_UPLOADED_AT` | `--store-metadata-uploaded-at` | `true` | 是否持久化元数据中的 `uploadedAt` |
+| `STORE_METADATA_DEVICE_ID` | `--store-metadata-device-id` | `true` | 是否持久化元数据中的 `deviceId` |
+| `STORE_METADATA_CONTENT_HASH` | `--store-metadata-content-hash` | `true` | 是否持久化元数据中的 `contentHash` |
+| `BACKUP_TO` | `--backup-to` | *(空)* | 导出数据库并生成 `.sha256` 校验文件 |
+| `RESTORE_FROM` | `--restore-from` | *(空)* | 从备份恢复数据库 |
+| `VERIFY_BACKUP` | `--verify-backup` | *(空)* | 校验备份及其 `.sha256` 文件是否一致 |
 | `RUST_LOG` | — | `info` | 日志级别过滤 |
 
 ## 从 OxideTerm 连接
@@ -112,19 +158,27 @@ cargo build --release
 ### 认证
 
 - API Token 仍通过 SHA-256 散列进行鉴权；新创建的 Token 会额外保存一份加密副本，便于管理面板后续回显
-- 每个 Token 可限定到命名空间模式（`*` 全部、精确匹配、`前缀*`），并强制区分 `read` / `write` 权限
-- 管理员 JWT 令牌 24 小时过期
+- 每个 Token 可限定到命名空间模式（`*` 全部、精确匹配、`前缀*`），支持 `read` / `write` 权限、过期时间、启用/禁用与轮换
+- 管理后台使用 HttpOnly Cookie 会话，默认启用 `SameSite=Strict` 与 `Secure`
+- 管理员 JWT 令牌本身仍为 24 小时有效
 - 管理员密码使用 bcrypt 散列
-- 管理员登录按客户端 IP 做内存级失败限速；若部署在可信反向代理后，请仅在代理会覆盖转发头时启用 `TRUST_PROXY_HEADERS=true`
+- 管理员登录按客户端 IP 做持久化失败限速，阈值可配置；若部署在可信反向代理后，请仅在代理会覆盖转发头时启用 `TRUST_PROXY_HEADERS=true`
 - 未设置 `ADMIN_JWT_SECRET` 时，服务重启会使所有管理会话失效
 - 在此功能上线前创建的旧 Token 无法反向恢复；如需回显能力，请重新创建一个 Token
 - 若未持久化配置 `ENCRYPTION_KEY` 或 `ADMIN_JWT_SECRET`，Token 回显仅能持续到下一次服务重启
+- 管理审计日志不会记录明文 Token、密码或同步内容
 
 ### 网络
 
 - 生产环境请务必使用 HTTPS（反向代理：nginx / Caddy / Traefik）
-- 同步 API 默认为跨域开放，便于 OxideTerm 客户端接入；管理接口不挂在 CORS 层上
+- 仅当配置 `SYNC_CORS_ALLOWED_ORIGINS` 时，同步 API 才会发送 CORS 响应头；管理接口始终不挂在 CORS 层上
 - 管理面板应仅在可信网络中访问
+
+### 数据生命周期
+
+- 管理面板里的命名空间删除默认为软删除。软删除后，同步流量会被拦截，直到手动恢复。
+- 永久删除是单独的清除动作，会彻底移除命名空间的元数据、blob 和 retained objects。
+- 可以按需关闭 `revision`、`uploadedAt`、`deviceId`、`contentHash` 的持久化，以减少元数据保留量。
 
 ## API 参考
 
@@ -139,18 +193,24 @@ cargo build --release
 | `GET` | `/v1/namespaces/:ns/objects/*path` | 下载结构化对象，并返回 `ETag` |
 | `PUT` | `/v1/namespaces/:ns/objects/*path` | 上传结构化对象，支持 `If-Match` / `If-None-Match` |
 | `GET` | `/health` | 健康检查（无需认证） |
+| `GET` | `/ready` | 就绪检查（包含数据库与关键配置状态） |
 
-### 管理 API（需要管理员 JWT）
+### 管理 API（需要管理员会话 Cookie）
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/admin/api/login` | 管理员登录 |
+| `POST` | `/admin/api/logout` | 清除管理员会话 |
 | `GET` | `/admin/api/stats` | 服务器统计 |
 | `GET` | `/admin/api/namespaces` | 列出所有命名空间 |
 | `POST` | `/admin/api/namespaces` | 创建命名空间 |
-| `DELETE` | `/admin/api/namespaces/:ns` | 删除命名空间 |
+| `DELETE` | `/admin/api/namespaces/:ns` | 软删除命名空间 |
+| `DELETE` | `/admin/api/namespaces/:ns?hard=true` | 永久清除命名空间 |
+| `POST` | `/admin/api/namespaces/:ns/restore` | 恢复软删除命名空间 |
 | `GET` | `/admin/api/tokens` | 列出 API Token |
 | `POST` | `/admin/api/tokens` | 创建 API Token |
+| `PATCH` | `/admin/api/tokens/:id` | 更新 `enabled` / `expiresAt` |
+| `POST` | `/admin/api/tokens/:id/rotate` | 轮换 API Token 并返回新的密钥 |
 | `GET` | `/admin/api/tokens/:id/reveal` | 回显已有 API Token |
 | `DELETE` | `/admin/api/tokens/:id` | 删除 API Token |
 

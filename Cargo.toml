@@ -45,6 +45,10 @@ urlencoding = "2"
 dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
 mime = "0.3"
+libc = "0.2"
 
 # Embedded admin panel
 rust-embed = { version = "8", features = ["compression"] }
+
+[dev-dependencies]
+tempfile = "3"

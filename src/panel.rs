@@ -7,6 +7,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -18,6 +19,7 @@ use std::{
 use crate::api::AppState;
 use crate::auth;
 use crate::config::*;
+use crate::crypto;
 use crate::error::AppError;
 
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
@@ -43,6 +45,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
             get(admin_list_tokens).post(admin_create_token),
         )
         .route("/admin/api/tokens/{id}", delete(admin_delete_token))
+        .route("/admin/api/tokens/{id}/reveal", get(admin_reveal_token))
         .route("/admin/api/stats", get(admin_stats))
 }
 
@@ -224,6 +227,7 @@ async fn admin_list_tokens(
             json!({
                 "id": t.id,
                 "name": t.name,
+                "canReveal": t.encrypted_token.is_some(),
                 "namespacePattern": t.namespace_pattern,
                 "permissions": t.permissions,
                 "createdAt": t.created_at,
@@ -272,12 +276,16 @@ async fn admin_create_token(
     // Generate a secure random token
     let raw_token = uuid::Uuid::new_v4().to_string();
     let token_hash = auth::hash_api_token(&raw_token);
+    let encrypted_token = crypto::encrypt(&state.token_reveal_key, raw_token.as_bytes())
+        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+        .map_err(|e| AppError::Internal(format!("Token encryption failed: {e}")))?;
     let id = uuid::Uuid::new_v4().to_string();
 
     let token = ApiToken {
         id: id.clone(),
         name: body.name,
         token_hash,
+        encrypted_token: Some(encrypted_token),
         namespace_pattern: body.namespace_pattern,
         permissions,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -286,7 +294,7 @@ async fn admin_create_token(
 
     state.db.set_token(&token)?;
 
-    // Return the raw token ONCE — it cannot be retrieved again
+    // Return the raw token immediately so the user can copy it without an extra reveal roundtrip.
     Ok(Json(json!({
         "id": id,
         "token": raw_token,
@@ -294,6 +302,47 @@ async fn admin_create_token(
         "namespacePattern": token.namespace_pattern,
         "permissions": token.permissions,
         "createdAt": token.created_at,
+    })))
+}
+
+// ── GET /admin/api/tokens/:id/reveal ──
+
+async fn admin_reveal_token(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    verify_admin(&headers, &state)?;
+
+    let token = state
+        .db
+        .get_token(&id)?
+        .ok_or_else(|| AppError::NotFound(format!("Token '{id}' not found")))?;
+    let encrypted_token = token.encrypted_token.ok_or_else(|| {
+        AppError::BadRequest(
+            "This token was created before reveal support and cannot be recovered. Create a new token to enable reveal.".to_string(),
+        )
+    })?;
+
+    let encrypted_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encrypted_token)
+        .map_err(|e| AppError::Internal(format!("Stored token decode failed: {e}")))?;
+    let raw_token = crypto::decrypt(&state.token_reveal_key, &encrypted_bytes)
+        .map_err(|_| {
+            AppError::BadRequest(
+                "This token can no longer be revealed because the server secret changed. Re-create it to recover access.".to_string(),
+            )
+        })
+        .and_then(|bytes| {
+            String::from_utf8(bytes).map_err(|e| {
+                AppError::Internal(format!("Stored token is not valid UTF-8: {e}"))
+            })
+        })?;
+
+    Ok(Json(json!({
+        "id": token.id,
+        "token": raw_token,
+        "persistent": state.token_reveal_persistent,
     })))
 }
 
@@ -391,6 +440,7 @@ async fn admin_stats(
         "namespaceCount": namespaces.len(),
         "tokenCount": tokens.len(),
         "encryptionEnabled": encrypted,
+        "tokenRevealPersistent": state.token_reveal_persistent,
         "version": env!("CARGO_PKG_VERSION"),
     })))
 }
@@ -547,6 +597,17 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
   }
   .token-reveal .label { font-size: 0.75rem; color: var(--ot-text-muted); margin-bottom: 0.25rem; }
   .token-reveal .value { font-family: var(--font-mono); font-size: 0.875rem; }
+  .token-inline {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .token-inline .value {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    word-break: break-all;
+  }
   .empty-state { text-align: center; padding: 2rem; color: var(--ot-text-muted); }
   .login-wrapper {
     display: flex;
@@ -649,7 +710,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
       <button class="btn btn-sm" onclick="hideCreateToken()">Cancel</button>
     </div>
     <div id="new-token-reveal" class="token-reveal hidden">
-      <div class="label">This token will only be shown once. Copy it now.</div>
+      <div class="label">Copy this token now. You can reveal it again later from this panel while the server keeps its reveal key.</div>
       <div class="value" id="new-token-value"></div>
     </div>
     <div id="tokens-table"></div>
@@ -676,6 +737,8 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
 <script>
 const API = '/admin/api';
 let jwt = localStorage.getItem('admin_jwt');
+let tokenRevealPersistent = false;
+const revealedTokens = {};
 
 // ── Init ──
 if (jwt) { showDashboard(); } else { showLogin(); }
@@ -685,11 +748,11 @@ function showLogin() {
   document.getElementById('dashboard').classList.add('hidden');
 }
 
-function showDashboard() {
+async function showDashboard() {
   document.getElementById('login-screen').classList.add('hidden');
   document.getElementById('dashboard').classList.remove('hidden');
-  loadStats();
-  loadTokens();
+  await loadStats();
+  await loadTokens();
   loadNamespaces();
 }
 
@@ -720,7 +783,7 @@ document.getElementById('login-form').addEventListener('submit', async (e) => {
     const data = await res.json();
     jwt = data.token;
     localStorage.setItem('admin_jwt', jwt);
-    showDashboard();
+    await showDashboard();
   } catch (err) {
     errEl.textContent = 'Network error';
     errEl.classList.remove('hidden');
@@ -746,6 +809,7 @@ async function loadStats() {
     document.getElementById('stat-tokens').textContent = d.tokenCount;
     document.getElementById('stat-encryption').textContent = d.encryptionEnabled ? 'ON' : 'OFF';
     document.getElementById('stat-version').textContent = 'v' + d.version;
+    tokenRevealPersistent = !!d.tokenRevealPersistent;
   } catch {}
 }
 
@@ -760,15 +824,29 @@ async function loadTokens() {
       return;
     }
     el.innerHTML = `<table>
-      <thead><tr><th>Name</th><th>Namespace</th><th>Created</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Namespace</th><th>Token</th><th>Created</th><th></th></tr></thead>
       <tbody>${tokens.map(t => `<tr>
         <td>${esc(t.name)}</td>
         <td class="mono">${esc(t.namespacePattern)}</td>
+        <td>${renderTokenCell(t)}</td>
         <td>${new Date(t.createdAt).toLocaleDateString()}</td>
-        <td><button class="btn btn-danger btn-sm" onclick="deleteToken('${t.id}')">Delete</button></td>
+        <td>
+          ${t.canReveal ? `<button class="btn btn-sm" onclick="toggleTokenReveal('${t.id}')">${revealedTokens[t.id] ? 'Hide' : 'Show'}</button>` : `<span class="badge badge-red">Legacy</span>`}
+          <button class="btn btn-danger btn-sm" onclick="deleteToken('${t.id}')">Delete</button>
+        </td>
       </tr>`).join('')}</tbody>
     </table>`;
   } catch {}
+}
+
+function renderTokenCell(token) {
+  if (revealedTokens[token.id]) {
+    return `<div class="token-inline"><span class="value">${esc(revealedTokens[token.id])}</span><button class="btn btn-sm" onclick="copyToken('${token.id}')">Copy</button></div>`;
+  }
+  if (token.canReveal) {
+    return `<span class="badge badge-green">${tokenRevealPersistent ? 'Recoverable' : 'Recoverable until restart'}</span>`;
+  }
+  return '<span class="badge badge-red">Legacy token</span>';
 }
 
 function showCreateToken() {
@@ -794,8 +872,34 @@ async function createToken() {
     hideCreateToken();
     document.getElementById('token-name').value = '';
     document.getElementById('token-ns').value = '';
+    await loadStats();
+    await loadTokens();
+  } catch {}
+}
+
+async function toggleTokenReveal(id) {
+  if (revealedTokens[id]) {
+    delete revealedTokens[id];
     loadTokens();
-    loadStats();
+    return;
+  }
+  try {
+    const res = await api(`/tokens/${id}/reveal`);
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error?.message || 'Failed to reveal token');
+      return;
+    }
+    revealedTokens[id] = data.token;
+    loadTokens();
+  } catch {}
+}
+
+async function copyToken(id) {
+  const token = revealedTokens[id];
+  if (!token) return;
+  try {
+    await navigator.clipboard.writeText(token);
   } catch {}
 }
 
@@ -803,8 +907,9 @@ async function deleteToken(id) {
   if (!confirm('Delete this token? Clients using it will lose access.')) return;
   try {
     await api(`/tokens/${id}`, { method: 'DELETE' });
-    loadTokens();
-    loadStats();
+    delete revealedTokens[id];
+    await loadStats();
+    await loadTokens();
   } catch {}
 }
 

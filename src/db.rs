@@ -314,9 +314,14 @@ impl Database {
             return Ok(None);
         };
 
+        self.get_token(token_id.value())
+    }
+
+    pub fn get_token(&self, id: &str) -> Result<Option<ApiToken>, redb::Error> {
+        let read_txn = self.inner.begin_read()?;
         let token_table = read_txn.open_table(TOKEN_TABLE)?;
         Ok(token_table
-            .get(token_key(token_id.value()).as_str())?
+            .get(token_key(id).as_str())?
             .map(|value| serde_json::from_slice::<ApiToken>(value.value()))
             .transpose()
             .map_err(|e| {

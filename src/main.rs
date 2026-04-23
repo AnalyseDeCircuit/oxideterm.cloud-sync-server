@@ -94,15 +94,22 @@ async fn main() {
         .as_deref()
         .map(|pw| auth::hash_admin_password(pw).expect("Failed to hash admin password"));
 
+    let jwt_secret = admin_jwt_secret
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let token_reveal_key =
+        encryption_key.unwrap_or_else(|| crypto::derive_key(jwt_secret.as_bytes()));
+    let token_reveal_persistent = encryption_key.is_some() || admin_jwt_secret.is_some();
+
     let database = db::Database::open(&cli.db_path).expect("Failed to open database");
 
     let state = api::AppState {
         db: database,
         encryption_key,
         admin_password_hash: admin_password_hash.clone(),
-        jwt_secret: admin_jwt_secret
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        jwt_secret,
+        token_reveal_key,
+        token_reveal_persistent,
         login_attempts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         trust_proxy_headers: cli.trust_proxy_headers,
         max_blob_size: cli.max_blob_size,

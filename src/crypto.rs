@@ -18,6 +18,14 @@ pub fn parse_hex_key(hex_str: &str) -> Result<[u8; 32], String> {
     Ok(key)
 }
 
+/// Derive a 32-byte symmetric key from arbitrary secret material using SHA-256.
+pub fn derive_key(secret_material: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(secret_material);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    key
+}
+
 /// Encrypt data at rest using ChaCha20-Poly1305.
 /// Returns: nonce (12 bytes) || ciphertext (with 16-byte auth tag appended).
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
@@ -90,5 +98,14 @@ mod tests {
     fn parse_hex_key_invalid_length() {
         let hex = "00".repeat(16);
         assert!(parse_hex_key(&hex).is_err());
+    }
+
+    #[test]
+    fn derive_key_is_stable() {
+        let key1 = derive_key(b"admin-secret");
+        let key2 = derive_key(b"admin-secret");
+        let key3 = derive_key(b"different-secret");
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
     }
 }

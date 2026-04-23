@@ -52,6 +52,8 @@ pub struct AppState {
     pub encryption_key: Option<[u8; 32]>,
     pub admin_password_hash: Option<String>,
     pub jwt_secret: String,
+    pub token_reveal_key: [u8; 32],
+    pub token_reveal_persistent: bool,
     pub login_attempts: Arc<Mutex<HashMap<IpAddr, LoginAttemptState>>>,
     pub trust_proxy_headers: bool,
     pub max_blob_size: usize,

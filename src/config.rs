@@ -138,6 +138,8 @@ pub struct ApiToken {
     pub id: String,
     pub name: String,
     pub token_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_token: Option<String>,
     pub namespace_pattern: String,
     pub permissions: Vec<String>,
     pub created_at: String,

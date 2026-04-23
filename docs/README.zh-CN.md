@@ -111,12 +111,14 @@ cargo build --release
 
 ### 认证
 
-- API Token 以 SHA-256 散列后存储，原始 Token 仅在创建时展示一次
+- API Token 仍通过 SHA-256 散列进行鉴权；新创建的 Token 会额外保存一份加密副本，便于管理面板后续回显
 - 每个 Token 可限定到命名空间模式（`*` 全部、精确匹配、`前缀*`），并强制区分 `read` / `write` 权限
 - 管理员 JWT 令牌 24 小时过期
 - 管理员密码使用 bcrypt 散列
 - 管理员登录按客户端 IP 做内存级失败限速；若部署在可信反向代理后，请仅在代理会覆盖转发头时启用 `TRUST_PROXY_HEADERS=true`
 - 未设置 `ADMIN_JWT_SECRET` 时，服务重启会使所有管理会话失效
+- 在此功能上线前创建的旧 Token 无法反向恢复；如需回显能力，请重新创建一个 Token
+- 若未持久化配置 `ENCRYPTION_KEY` 或 `ADMIN_JWT_SECRET`，Token 回显仅能持续到下一次服务重启
 
 ### 网络
 
@@ -149,6 +151,7 @@ cargo build --release
 | `DELETE` | `/admin/api/namespaces/:ns` | 删除命名空间 |
 | `GET` | `/admin/api/tokens` | 列出 API Token |
 | `POST` | `/admin/api/tokens` | 创建 API Token |
+| `GET` | `/admin/api/tokens/:id/reveal` | 回显已有 API Token |
 | `DELETE` | `/admin/api/tokens/:id` | 删除 API Token |
 
 ## 法律声明

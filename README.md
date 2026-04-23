@@ -111,12 +111,14 @@ When `ENCRYPTION_KEY` is *not* set:
 
 ### Authentication
 
-- API tokens are hashed with SHA-256 before storage — the raw token is shown once at creation
+- API tokens are still authenticated by SHA-256 hash lookup; newly created tokens also keep an encrypted copy so the admin panel can reveal them later
 - Each token is scoped to a namespace pattern (`*`, `exact`, or `prefix*`) and explicit `read` / `write` permissions
 - Admin JWT tokens expire after 24 hours
 - Admin password is hashed with bcrypt
 - Failed admin logins are throttled in memory by client IP; behind a reverse proxy, enable `TRUST_PROXY_HEADERS=true` only if the proxy overwrites forwarding headers
 - If `ADMIN_JWT_SECRET` is omitted, all admin sessions are invalidated on restart
+- Existing tokens created before this feature cannot be reconstructed; create a replacement token if you need reveal support
+- If neither `ENCRYPTION_KEY` nor `ADMIN_JWT_SECRET` is configured persistently, token reveal works only until the next server restart
 
 ### Network
 
@@ -149,6 +151,7 @@ When `ENCRYPTION_KEY` is *not* set:
 | `DELETE` | `/admin/api/namespaces/:ns` | Delete a namespace |
 | `GET` | `/admin/api/tokens` | List API tokens |
 | `POST` | `/admin/api/tokens` | Create API token |
+| `GET` | `/admin/api/tokens/:id/reveal` | Reveal an existing API token |
 | `DELETE` | `/admin/api/tokens/:id` | Delete API token |
 
 ## Disclaimer

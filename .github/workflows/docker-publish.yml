@@ -87,7 +87,7 @@ jobs:
           if-no-files-found: error
 
       - name: Scan image
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           format: sarif
@@ -97,7 +97,7 @@ jobs:
           exit-code: "1"
 
       - name: Upload vulnerability scan results
-        uses: github/codeql-action/upload-sarif@0b7cfa37d6c7a32e4a1d2721596bd2a5c0443231
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e
         if: always()
         with:
           sarif_file: trivy-results.sarif

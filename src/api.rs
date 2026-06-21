@@ -2,14 +2,14 @@
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Redirect},
     routing::get,
     Json, Router,
 };
 use serde_json::json;
-use std::{ffi::CString, sync::Arc};
+use std::{ffi::CString, net::SocketAddr, sync::Arc};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::auth;
@@ -19,12 +19,15 @@ use crate::db::{ConditionalWriteError, Database};
 use crate::error::AppError;
 use crate::panel;
 
+const CLIENT_VERSION_HEADER: &str = "x-oxideterm-client-version";
+const MAX_CLIENT_VERSION_LEN: usize = 128;
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Database,
     pub db_path: String,
     pub encryption_key: Option<[u8; 32]>,
-    pub admin_password_hash: Option<String>,
+    pub admin_enabled: bool,
     pub jwt_secret: String,
     pub admin_jwt_secret_persistent: bool,
     pub admin_cookie_secure: bool,
@@ -34,6 +37,7 @@ pub struct AppState {
     pub sync_cors_allowed_origins: Vec<String>,
     pub max_blob_size: usize,
     pub max_object_size: usize,
+    pub min_free_disk_bytes: u64,
     pub login_window_seconds: i64,
     pub login_lockout_seconds: i64,
     pub max_login_failures: u32,
@@ -120,7 +124,10 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let db_size_bytes = std::fs::metadata(&state.db_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let ready = db_writable;
+    let disk_above_minimum = disk_free_bytes
+        .map(|free| free >= state.min_free_disk_bytes)
+        .unwrap_or(true);
+    let ready = db_writable && disk_above_minimum;
 
     let status = if ready {
         StatusCode::OK
@@ -135,15 +142,17 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRespons
             "dbWritable": db_writable,
             "dbSizeBytes": db_size_bytes,
             "diskFreeBytes": disk_free_bytes,
+            "minFreeDiskBytes": state.min_free_disk_bytes,
+            "diskAboveMinimum": disk_above_minimum,
             "encryptionEnabled": state.encryption_key.is_some(),
-            "adminEnabled": state.admin_password_hash.is_some(),
+            "adminEnabled": state.admin_enabled,
             "jwtSecretPersistent": state.admin_jwt_secret_persistent,
         })),
     )
 }
 
 #[cfg(unix)]
-fn disk_free_bytes(path: &str) -> Option<u64> {
+pub(crate) fn disk_free_bytes(path: &str) -> Option<u64> {
     let c_path = CString::new(path).ok()?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
@@ -151,12 +160,35 @@ fn disk_free_bytes(path: &str) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    let available_blocks = stats.f_bavail as u128;
+    let fragment_size = stats.f_frsize as u128;
+    Some(
+        available_blocks
+            .saturating_mul(fragment_size)
+            .min(u64::MAX as u128) as u64,
+    )
 }
 
 #[cfg(not(unix))]
-fn disk_free_bytes(_path: &str) -> Option<u64> {
+pub(crate) fn disk_free_bytes(_path: &str) -> Option<u64> {
     None
+}
+
+pub(crate) fn ensure_disk_capacity(state: &AppState, incoming_bytes: u64) -> Result<(), AppError> {
+    if state.min_free_disk_bytes == 0 {
+        return Ok(());
+    }
+
+    let Some(free_bytes) = disk_free_bytes(&state.db_path) else {
+        return Ok(());
+    };
+    let required_bytes = state.min_free_disk_bytes.saturating_add(incoming_bytes);
+    if free_bytes < required_bytes {
+        return Err(AppError::InsufficientStorage(format!(
+            "Only {free_bytes} bytes free; refusing write because at least {required_bytes} bytes are required"
+        )));
+    }
+    Ok(())
 }
 
 // ── Auth Helper ──
@@ -176,8 +208,8 @@ fn extract_auth(headers: &HeaderMap, state: &AppState) -> Result<ApiToken, AppEr
         let credential = String::from_utf8(decoded)
             .map_err(|_| AppError::Unauthorized("Invalid Basic auth encoding".to_string()))?;
         credential
-            .splitn(2, ':')
-            .nth(1)
+            .split_once(':')
+            .map(|(_, password)| password)
             .unwrap_or(&credential)
             .to_string()
     } else {
@@ -193,7 +225,6 @@ fn extract_auth(headers: &HeaderMap, state: &AppState) -> Result<ApiToken, AppEr
         .map_err(|e| AppError::Internal(format!("Token lookup error: {e}")))?;
 
     let token = token.ok_or_else(|| AppError::Unauthorized("Invalid token".to_string()))?;
-    ensure_token_active(&token)?;
     Ok(token)
 }
 
@@ -226,28 +257,80 @@ fn authorize_sync_request_with_permission(
     state: &AppState,
     namespace: &str,
     permission: SyncPermission,
+    peer_addr: SocketAddr,
 ) -> Result<ApiToken, AppError> {
     ensure_namespace_active(state, namespace)?;
     let token = extract_auth(headers, state)?;
+    if let Err(error) = ensure_token_active(&token) {
+        record_token_failure(state, &token.id)?;
+        return Err(error);
+    }
     if !auth::namespace_matches(namespace, &token.namespace_pattern) {
+        record_token_failure(state, &token.id)?;
         return Err(AppError::Forbidden(format!(
             "Token not authorized for namespace '{namespace}'"
         )));
     }
 
     if !auth::permissions_allow(&token.permissions, permission.as_str()) {
+        record_token_failure(state, &token.id)?;
         return Err(AppError::Forbidden(format!(
             "Token is missing '{}' permission",
             permission.as_str()
         )));
     }
 
+    let client_ip = resolve_sync_client_ip(headers, peer_addr, state);
+    let client_version = sync_client_version(headers);
     state
         .db
-        .touch_token_last_used(&token.id, &chrono::Utc::now().to_rfc3339())
+        .record_token_usage(
+            &token.id,
+            namespace,
+            permission.as_str(),
+            &client_ip,
+            client_version.as_deref(),
+            &chrono::Utc::now().to_rfc3339(),
+        )
         .map_err(|e| AppError::Internal(format!("Failed to update token audit info: {e}")))?;
 
     Ok(token)
+}
+
+fn record_token_failure(state: &AppState, token_id: &str) -> Result<(), AppError> {
+    state
+        .db
+        .record_token_failure(token_id)
+        .map_err(|e| AppError::Internal(format!("Failed to update token failure count: {e}")))
+}
+
+fn resolve_sync_client_ip(headers: &HeaderMap, peer_addr: SocketAddr, state: &AppState) -> String {
+    if !state.trust_proxy_headers {
+        return peer_addr.ip().to_string();
+    }
+
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::trim)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| peer_addr.ip())
+        .to_string()
+}
+
+fn sync_client_version(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(CLIENT_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(MAX_CLIENT_VERSION_LEN).collect())
 }
 
 fn ensure_namespace_active(state: &AppState, namespace: &str) -> Result<(), AppError> {
@@ -319,6 +402,58 @@ fn map_conditional_write_error(error: ConditionalWriteError) -> AppError {
     }
 }
 
+struct ConflictObservation<'a> {
+    namespace: &'a str,
+    operation: &'a str,
+    object_path: Option<&'a str>,
+    device_id: Option<&'a str>,
+    requested_revision: Option<&'a str>,
+    requested_etag: Option<&'a str>,
+}
+
+fn record_conditional_write_conflict(
+    state: &AppState,
+    observation: ConflictObservation<'_>,
+    error: &ConditionalWriteError,
+) -> Result<(), AppError> {
+    if let ConditionalWriteError::Conflict {
+        remote_revision,
+        remote_etag,
+        message,
+    } = error
+    {
+        let conflict = SyncConflictRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            occurred_at: chrono::Utc::now().to_rfc3339(),
+            namespace: observation.namespace.to_string(),
+            operation: observation.operation.to_string(),
+            object_path: observation.object_path.map(str::to_string),
+            device_id: observation.device_id.map(str::to_string),
+            requested_revision: observation.requested_revision.map(str::to_string),
+            requested_etag: observation.requested_etag.map(str::to_string),
+            remote_revision: remote_revision.clone(),
+            remote_etag: remote_etag.clone(),
+            message: message.clone(),
+        };
+        state
+            .db
+            .add_sync_conflict(&conflict)
+            .map_err(|e| AppError::Internal(format!("Failed to record sync conflict: {e}")))?;
+    }
+    Ok(())
+}
+
+fn request_etag_for_conflict(
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+) -> Option<String> {
+    if_match
+        .or(if_none_match)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 /// Validate namespace names: 1-128 chars, alphanumeric + dash/underscore/dot only.
 pub(crate) fn validate_namespace(ns: &str) -> Result<(), AppError> {
     if ns.is_empty() || ns.len() > 128 {
@@ -366,10 +501,17 @@ fn retain_metadata_value<T>(enabled: bool, value: Option<T>) -> Option<T> {
 async fn get_metadata(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Read)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Read,
+        addr,
+    )?;
 
     match state.db.get_metadata(&namespace)? {
         Some(data) => {
@@ -385,11 +527,19 @@ async fn get_metadata(
 async fn put_metadata(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<MetadataWriteRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Write)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Write,
+        addr,
+    )?;
+    ensure_disk_capacity(&state, 256 * 1024)?;
 
     let existing = state
         .db
@@ -414,7 +564,7 @@ async fn put_metadata(
         ),
         uploaded_at: retain_metadata_value(
             state.metadata_retention.store_uploaded_at,
-            body.uploaded_at.or(Some(now)),
+            body.uploaded_at.or(Some(now.clone())),
         ),
         device_id: retain_metadata_value(state.metadata_retention.store_device_id, body.device_id),
         content_length: existing.as_ref().map(|e| e.content_length).unwrap_or(0),
@@ -426,6 +576,7 @@ async fn put_metadata(
 
     let serialized = serde_json::to_vec(&meta)?;
     state.db.set_metadata(&namespace, &serialized)?;
+    state.db.refresh_namespace_usage(&namespace, &now, false)?;
 
     Ok(Json(WriteResponse {
         ok: true,
@@ -441,10 +592,17 @@ async fn put_metadata(
 async fn get_blob(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Read)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Read,
+        addr,
+    )?;
 
     let encrypted_blob = state
         .db
@@ -478,11 +636,18 @@ async fn get_blob(
 async fn put_blob(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Write)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Write,
+        addr,
+    )?;
 
     if body.len() > state.max_blob_size {
         return Err(AppError::PayloadTooLarge(format!(
@@ -491,6 +656,7 @@ async fn put_blob(
             state.max_blob_size
         )));
     }
+    ensure_disk_capacity(&state, body.len() as u64)?;
 
     let existing_meta = state
         .db
@@ -508,6 +674,7 @@ async fn put_blob(
         .get("x-oxideterm-device-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+    let conflict_device_id = device_id.clone();
     let section_revisions_raw = headers
         .get("x-oxideterm-section-revisions")
         .and_then(|v| v.to_str().ok());
@@ -540,16 +707,32 @@ async fn put_blob(
     };
 
     let serialized_meta = serde_json::to_vec(&meta)?;
+    let write_result = state.db.put_blob_if_matches(
+        &namespace,
+        if_match,
+        if_none_match == Some("*"),
+        &encrypted,
+        &serialized_meta,
+    );
+    if let Err(error) = write_result {
+        let requested_etag = request_etag_for_conflict(if_match, if_none_match);
+        record_conditional_write_conflict(
+            &state,
+            ConflictObservation {
+                namespace: &namespace,
+                operation: "blob",
+                object_path: None,
+                device_id: conflict_device_id.as_deref(),
+                requested_revision: revision.as_deref(),
+                requested_etag: requested_etag.as_deref(),
+            },
+            &error,
+        )?;
+        return Err(map_conditional_write_error(error));
+    }
     state
         .db
-        .put_blob_if_matches(
-            &namespace,
-            if_match,
-            if_none_match == Some("*"),
-            &encrypted,
-            &serialized_meta,
-        )
-        .map_err(map_conditional_write_error)?;
+        .refresh_namespace_usage(&namespace, &chrono::Utc::now().to_rfc3339(), false)?;
 
     Ok(Json(WriteResponse {
         ok: true,
@@ -565,10 +748,17 @@ async fn put_blob(
 async fn get_object(
     State(state): State<Arc<AppState>>,
     Path((namespace, obj_path)): Path<(String, String)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Read)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Read,
+        addr,
+    )?;
 
     let decoded_path = decode_object_path(&obj_path)?;
 
@@ -604,11 +794,18 @@ async fn get_object(
 async fn put_object(
     State(state): State<Arc<AppState>>,
     Path((namespace, obj_path)): Path<(String, String)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let namespace = decode_namespace(&namespace)?;
-    authorize_sync_request_with_permission(&headers, &state, &namespace, SyncPermission::Write)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Write,
+        addr,
+    )?;
 
     let decoded_path = decode_object_path(&obj_path)?;
 
@@ -619,6 +816,7 @@ async fn put_object(
             state.max_object_size
         )));
     }
+    ensure_disk_capacity(&state, body.len() as u64)?;
 
     let encrypted = encrypt_if_needed(&state, &body)?;
     let etag = uuid::Uuid::new_v4().to_string();
@@ -628,18 +826,42 @@ async fn put_object(
     };
     let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
     let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
+    let revision = headers
+        .get("x-oxideterm-revision")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let device_id = headers
+        .get("x-oxideterm-device-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
+    let write_result = state.db.put_object_if_matches(
+        &namespace,
+        &decoded_path,
+        if_match,
+        if_none_match == Some("*"),
+        &encrypted,
+        &object_meta,
+    );
+    if let Err(error) = write_result {
+        let requested_etag = request_etag_for_conflict(if_match, if_none_match);
+        record_conditional_write_conflict(
+            &state,
+            ConflictObservation {
+                namespace: &namespace,
+                operation: "object",
+                object_path: Some(&decoded_path),
+                device_id: device_id.as_deref(),
+                requested_revision: revision.as_deref(),
+                requested_etag: requested_etag.as_deref(),
+            },
+            &error,
+        )?;
+        return Err(map_conditional_write_error(error));
+    }
     state
         .db
-        .put_object_if_matches(
-            &namespace,
-            &decoded_path,
-            if_match,
-            if_none_match == Some("*"),
-            &encrypted,
-            &object_meta,
-        )
-        .map_err(map_conditional_write_error)?;
+        .refresh_namespace_usage(&namespace, &chrono::Utc::now().to_rfc3339(), false)?;
 
     Ok(Json(ObjectWriteResponse { etag: Some(etag) }))
 }
@@ -663,6 +885,14 @@ mod tests {
             rotated_at: None,
             disabled_at: None,
             last_used_at: None,
+            device_id: None,
+            read_count: 0,
+            write_count: 0,
+            failed_count: 0,
+            last_namespace: None,
+            last_permission: None,
+            last_client_ip: None,
+            last_client_version: None,
         };
         assert!(ensure_token_active(&token).is_err());
     }

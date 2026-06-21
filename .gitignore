@@ -2,6 +2,7 @@
 /target
 /debug
 /release
+/dist
 
 # IDE
 .idea/

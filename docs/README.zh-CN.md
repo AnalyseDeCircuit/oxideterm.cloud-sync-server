@@ -9,9 +9,10 @@
 - **可选静态数据加密** — 使用 ChaCha20-Poly1305 AEAD，加密密钥由您自行掌控。设置 `ENCRYPTION_KEY` 后，blob 和 object 载荷会在落盘前加密。
 - **结构化同步协议** — 完整支持 OxideTerm Cloud Sync 插件的 `structured-v1` 协议。连接、转发、设置等配置以独立对象存储，支持增量同步。
 - **并发控制** — 基于 ETag 的乐观锁机制覆盖 blob 与 object 上传，防止多设备同时上传时数据丢失。
-- **作用域 API Token** — Token 仍通过 SHA-256 散列校验，同时支持过期时间、启用/禁用、轮换，以及新建 Token 的后台回显。
-- **管理后台** — 内嵌 SPA 管理面板，支持 Token 和命名空间管理。bcrypt 密码 + HttpOnly Cookie 会话保护，并带持久化登录限速与审计日志。
+- **作用域 API Token** — Token 仍通过 SHA-256 散列校验，同时支持过期时间、启用/禁用、轮换、后台回显、设备绑定与使用计数。
+- **管理后台** — 内嵌 SPA 管理面板，支持管理员用户、Token、设备、命名空间容量、同步冲突与生命周期管理。bcrypt 密码 + HttpOnly Cookie 会话保护，并带持久化登录限速与审计日志。
 - **运维控制** — 支持命名空间软删除/恢复、`/ready` 就绪检查，以及 redb 数据库的离线备份/恢复/校验命令。
+- **供应链检查** — GitHub Actions 会执行 Rust 检查、依赖审计、镜像漏洞扫描、SBOM 生成与 keyless 镜像签名。
 - **单文件部署** — Rust + [redb](https://github.com/cberner/redb) 嵌入式数据库。无需 MySQL / PostgreSQL。Docker 镜像约 10 MB。
 
 ## 为什么要自建？
@@ -33,6 +34,7 @@
 # 生成加密密钥
 export ENCRYPTION_KEY=$(openssl rand -hex 32)
 export ADMIN_PASSWORD=你的安全密码
+export ADMIN_USERNAME=admin
 export ADMIN_JWT_SECRET=$(openssl rand -hex 32)
 export ADMIN_COOKIE_SECURE=true
 # 仅当可信反向代理会覆盖 X-Forwarded-For / X-Real-IP 时才设为 true
@@ -45,6 +47,7 @@ docker run -d \
   -v oxideterm-sync-data:/data \
   -e ENCRYPTION_KEY=$ENCRYPTION_KEY \
   -e ADMIN_PASSWORD=$ADMIN_PASSWORD \
+  -e ADMIN_USERNAME=$ADMIN_USERNAME \
   -e ADMIN_JWT_SECRET=$ADMIN_JWT_SECRET \
   -e ADMIN_COOKIE_SECURE=$ADMIN_COOKIE_SECURE \
   -e TRUST_PROXY_HEADERS=$TRUST_PROXY_HEADERS \
@@ -109,13 +112,15 @@ cargo build --release
 | `LISTEN_ADDR` | `--listen` | `0.0.0.0:8730` | 监听地址 |
 | `DB_PATH` | `--db-path` | `/data/sync.db` | 数据库文件路径 |
 | `ENCRYPTION_KEY` | `--encryption-key` | *(无)* | 32 字节十六进制加密密钥 |
-| `ADMIN_PASSWORD` | `--admin-password` | *(无)* | 管理面板密码（未设置则禁用面板） |
+| `ADMIN_PASSWORD` | `--admin-password` | *(无)* | 用于引导或更新默认管理员用户的密码（没有任何管理员用户时禁用面板） |
+| `ADMIN_USERNAME` | `--admin-username` | `admin` | 由 `ADMIN_PASSWORD` 引导的管理员用户名 |
 | `ADMIN_JWT_SECRET` | `--admin-jwt-secret` | 每次启动随机生成 | 管理面板 JWT 签名密钥 |
-| `ADMIN_COOKIE_SECURE` | `--admin-cookie-secure` | `true` | 是否为管理会话 Cookie 强制加上 `Secure` 标记（仅本地纯 HTTP 调试时建议关闭） |
+| `ADMIN_COOKIE_SECURE` | `--admin-cookie-secure` | `true` | 是否允许管理会话 Cookie 在 HTTPS / 可信代理 HTTPS 请求下使用 `Secure` 标记 |
 | `TRUST_PROXY_HEADERS` | `--trust-proxy-headers` | `false` | 是否信任 `X-Forwarded-For` / `X-Real-IP` 参与登录限速 |
 | `SYNC_CORS_ALLOWED_ORIGINS` | `--sync-cors-allowed-origins` | *(空)* | 同步 API 的 CORS 白名单，逗号分隔；设为 `*` 可放开全部来源 |
 | `MAX_BLOB_SIZE` | `--max-blob-size` | `67108864`（64 MiB） | 最大 blob 上传大小 |
 | `MAX_OBJECT_SIZE` | `--max-object-size` | `16777216`（16 MiB） | 最大对象上传大小 |
+| `MIN_FREE_DISK_BYTES` | `--min-free-disk-bytes` | `104857600`（100 MiB） | 接受写入前要求数据库所在卷至少保留的空闲空间 |
 | `LOGIN_WINDOW_SECONDS` | `--login-window-seconds` | `900` | 登录失败统计窗口 |
 | `LOGIN_LOCKOUT_SECONDS` | `--login-lockout-seconds` | `900` | 超过阈值后的临时锁定时长 |
 | `MAX_LOGIN_FAILURES` | `--max-login-failures` | `5` | 触发锁定前允许的最大失败次数 |
@@ -159,7 +164,13 @@ cargo build --release
 
 - API Token 仍通过 SHA-256 散列进行鉴权；新创建的 Token 会额外保存一份加密副本，便于管理面板后续回显
 - 每个 Token 可限定到命名空间模式（`*` 全部、精确匹配、`前缀*`），支持 `read` / `write` 权限、过期时间、启用/禁用与轮换
-- 管理后台使用 HttpOnly Cookie 会话，默认启用 `SameSite=Strict` 与 `Secure`
+- Token 使用画像只记录运营元数据：读/写/失败次数、最近命名空间、最近客户端 IP、最近客户端版本与最近使用时间；不会记录明文 Token、密码或同步载荷内容
+- 同步冲突追踪只记录最近 ETag 冲突的命名空间、操作、可选对象路径、设备 ID、请求/远端 revision 和请求/远端 ETag；不会保存同步载荷内容
+- 设备记录是管理后台的资产清单层，可关联 Token，并由同步观测更新 last seen；它目前不是第二认证因子
+- 管理员用户存储在 redb 中，密码以 bcrypt hash 保存；`ADMIN_PASSWORD` 会引导或更新配置的 `ADMIN_USERNAME`
+- 管理员用户会记录运营安全元数据，包括最近登录时间、最近登录 IP、登录失败次数、最近失败时间和密码更新时间
+- 管理后台使用 HttpOnly Cookie 会话，启用 `SameSite=Strict`；在可信 HTTPS 请求下带 `Secure`，直接 HTTP 本地访问时会自动省略 `Secure`，避免登录后会话 Cookie 被浏览器丢弃
+- 所有非 GET 管理 API 都需要 `x-csrf-token` 请求头与 `admin_csrf` 同站 Cookie 匹配
 - 管理员 JWT 令牌本身仍为 24 小时有效
 - 管理员密码使用 bcrypt 散列
 - 管理员登录按客户端 IP 做持久化失败限速，阈值可配置；若部署在可信反向代理后，请仅在代理会覆盖转发头时启用 `TRUST_PROXY_HEADERS=true`
@@ -173,11 +184,19 @@ cargo build --release
 - 生产环境请务必使用 HTTPS（反向代理：nginx / Caddy / Traefik）
 - 仅当配置 `SYNC_CORS_ALLOWED_ORIGINS` 时，同步 API 才会发送 CORS 响应头；管理接口始终不挂在 CORS 层上
 - 管理面板应仅在可信网络中访问
+- 同步和管理写入会在空闲空间低于 `MIN_FREE_DISK_BYTES` 前被拒绝；`/ready` 会以 `diskAboveMinimum=false` 暴露该状态
+
+### 供应链
+
+- `.github/workflows/ci.yml` 会运行格式检查、clippy、测试和 `cargo audit`。
+- `.github/workflows/docker-publish.yml` 会在发布前测试，构建 Docker 镜像，生成 SPDX SBOM，用 Trivy 扫描已推送镜像，上传 SARIF，并用 keyless cosign 对镜像 digest 签名。
+- 发布后的镜像可通过 `cosign verify ghcr.io/analysedecircuit/oxideterm.cloud-sync-server@sha256:<digest>` 验证。
 
 ### 数据生命周期
 
 - 管理面板里的命名空间删除默认为软删除。软删除后，同步流量会被拦截，直到手动恢复。
 - 永久删除是单独的清除动作，会彻底移除命名空间的元数据、blob 和 retained objects。
+- 命名空间列表会展示 blob 字节数、object 字节数、总字节数、最近写入时间、相对上一次写入快照的增长量和软删除占用，便于容量规划。
 - 可以按需关闭 `revision`、`uploadedAt`、`deviceId`、`contentHash` 的持久化，以减少元数据保留量。
 
 ## API 参考
@@ -201,7 +220,14 @@ cargo build --release
 | --- | --- | --- |
 | `POST` | `/admin/api/login` | 管理员登录 |
 | `POST` | `/admin/api/logout` | 清除管理员会话 |
+| `GET` | `/admin/api/me` | 当前管理员用户 |
+| `POST` | `/admin/api/me/password` | 修改当前管理员用户密码 |
 | `GET` | `/admin/api/stats` | 服务器统计 |
+| `GET` | `/admin/api/users` | 列出管理员用户 |
+| `POST` | `/admin/api/users` | 创建管理员用户 |
+| `PATCH` | `/admin/api/users/:username` | 更新管理员密码或启用状态 |
+| `DELETE` | `/admin/api/users/:username` | 删除管理员用户 |
+| `GET` | `/admin/api/conflicts` | 列出最近同步冲突 |
 | `GET` | `/admin/api/namespaces` | 列出所有命名空间 |
 | `POST` | `/admin/api/namespaces` | 创建命名空间 |
 | `DELETE` | `/admin/api/namespaces/:ns` | 软删除命名空间 |
@@ -209,10 +235,14 @@ cargo build --release
 | `POST` | `/admin/api/namespaces/:ns/restore` | 恢复软删除命名空间 |
 | `GET` | `/admin/api/tokens` | 列出 API Token |
 | `POST` | `/admin/api/tokens` | 创建 API Token |
-| `PATCH` | `/admin/api/tokens/:id` | 更新 `enabled` / `expiresAt` |
+| `PATCH` | `/admin/api/tokens/:id` | 更新 `enabled` / `expiresAt` / `deviceId` |
 | `POST` | `/admin/api/tokens/:id/rotate` | 轮换 API Token 并返回新的密钥 |
 | `GET` | `/admin/api/tokens/:id/reveal` | 回显已有 API Token |
 | `DELETE` | `/admin/api/tokens/:id` | 删除 API Token |
+| `GET` | `/admin/api/devices` | 列出已登记设备 |
+| `POST` | `/admin/api/devices` | 登记设备记录 |
+| `PATCH` | `/admin/api/devices/:id` | 更新设备元数据、启用状态或 Token 关联 |
+| `DELETE` | `/admin/api/devices/:id` | 删除设备记录 |
 
 ## 法律声明
 

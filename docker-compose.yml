@@ -16,6 +16,7 @@ services:
 
       # REQUIRED: Admin panel password
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
 
       # Recommended: keep admin sessions valid across restarts
       - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET}
@@ -23,12 +24,19 @@ services:
       # Optional: trust X-Forwarded-For / X-Real-IP for login throttling when behind a trusted reverse proxy
       - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS}
 
+      # Optional: allow admin cookies to use Secure on HTTPS / trusted proxy HTTPS requests
+      - ADMIN_COOKIE_SECURE=${ADMIN_COOKIE_SECURE}
+
+      # Optional: comma-separated CORS allowlist for browser-based sync API access
+      - SYNC_CORS_ALLOWED_ORIGINS=${SYNC_CORS_ALLOWED_ORIGINS}
+
       # Optional: custom listen address
       # - LISTEN_ADDR=0.0.0.0:8730
 
       # Optional: max upload sizes
       # - MAX_BLOB_SIZE=67108864   # 64 MiB
       # - MAX_OBJECT_SIZE=16777216 # 16 MiB
+      # - MIN_FREE_DISK_BYTES=104857600 # 100 MiB
 
       # Optional: log level
       - RUST_LOG=oxideterm_cloud_sync_server=info,tower_http=info

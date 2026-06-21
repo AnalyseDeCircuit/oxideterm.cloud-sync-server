@@ -9,7 +9,7 @@ mod error;
 mod panel;
 
 use clap::Parser;
-use config::MetadataRetentionConfig;
+use config::{AdminUserRecord, MetadataRetentionConfig};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long, env = "ADMIN_PASSWORD")]
     admin_password: Option<String>,
 
+    /// Admin username bootstrapped from ADMIN_PASSWORD.
+    #[arg(long, env = "ADMIN_USERNAME", default_value = "admin")]
+    admin_username: String,
+
     /// JWT signing secret for admin sessions.
     /// If omitted, a random secret is generated and all admin sessions expire on restart.
     #[arg(long, env = "ADMIN_JWT_SECRET")]
@@ -65,6 +69,10 @@ struct Cli {
     /// Maximum object size in bytes (default: 16 MiB)
     #[arg(long, env = "MAX_OBJECT_SIZE", default_value = "16777216")]
     max_object_size: usize,
+
+    /// Minimum free bytes required on the database volume before accepting writes.
+    #[arg(long, env = "MIN_FREE_DISK_BYTES", default_value = "104857600")]
+    min_free_disk_bytes: u64,
 
     /// Login failure observation window in seconds.
     #[arg(long, env = "LOGIN_WINDOW_SECONDS", default_value = "900")]
@@ -240,10 +248,6 @@ async fn main() {
         crypto::parse_hex_key(hex_key).expect("ENCRYPTION_KEY must be 64 hex chars (32 bytes)")
     });
 
-    let admin_password_hash = admin_password_raw
-        .as_deref()
-        .map(|pw| auth::hash_admin_password(pw).expect("Failed to hash admin password"));
-
     let jwt_secret = admin_jwt_secret
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -252,12 +256,48 @@ async fn main() {
     let token_reveal_persistent = encryption_key.is_some() || admin_jwt_secret.is_some();
 
     let database = db::Database::open(&cli.db_path).expect("Failed to open database");
+    if let Some(password) = admin_password_raw.as_deref() {
+        let username = cli.admin_username.trim();
+        assert!(!username.is_empty(), "ADMIN_USERNAME must not be empty");
+        let now = chrono::Utc::now().to_rfc3339();
+        let existing_user = database
+            .get_admin_user(username)
+            .expect("Failed to read admin user");
+        let user = AdminUserRecord {
+            username: username.to_string(),
+            password_hash: auth::hash_admin_password(password)
+                .expect("Failed to hash admin password"),
+            role: existing_user
+                .as_ref()
+                .map(|user| user.role.clone())
+                .unwrap_or_else(|| "admin".to_string()),
+            enabled: true,
+            created_at: existing_user
+                .as_ref()
+                .map(|user| user.created_at.clone())
+                .unwrap_or_else(|| now.clone()),
+            updated_at: now,
+            last_login_at: existing_user.and_then(|user| user.last_login_at),
+            last_login_ip: None,
+            failed_login_count: 0,
+            last_failed_login_at: None,
+            password_updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            disabled_at: None,
+        };
+        database
+            .set_admin_user(&user)
+            .expect("Failed to bootstrap admin user");
+    }
+    let admin_enabled = !database
+        .list_admin_users()
+        .expect("Failed to list admin users")
+        .is_empty();
 
     let state = api::AppState {
         db: database,
         db_path: cli.db_path.clone(),
         encryption_key,
-        admin_password_hash: admin_password_hash.clone(),
+        admin_enabled,
         jwt_secret,
         admin_jwt_secret_persistent: admin_jwt_secret.is_some(),
         admin_cookie_secure: cli.admin_cookie_secure,
@@ -272,6 +312,7 @@ async fn main() {
             .collect(),
         max_blob_size: cli.max_blob_size,
         max_object_size: cli.max_object_size,
+        min_free_disk_bytes: cli.min_free_disk_bytes,
         login_window_seconds: cli.login_window_seconds,
         login_lockout_seconds: cli.login_lockout_seconds,
         max_login_failures: cli.max_login_failures,
@@ -296,7 +337,7 @@ async fn main() {
     } else {
         tracing::warn!("Server-side encryption: DISABLED — blobs stored in plaintext");
     }
-    if admin_password_hash.is_some() {
+    if admin_enabled {
         tracing::info!("Admin panel: ENABLED at /admin");
         if admin_jwt_secret.is_none() {
             tracing::warn!(

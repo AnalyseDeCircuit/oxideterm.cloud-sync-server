@@ -17,6 +17,7 @@ pub enum AppError {
         remote_etag: Option<String>,
     },
     PayloadTooLarge(String),
+    InsufficientStorage(String),
     TooManyRequests(String),
     Internal(String),
 }
@@ -69,6 +70,12 @@ impl IntoResponse for AppError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 json!({
                     "error": { "code": "payload_too_large", "message": msg }
+                }),
+            ),
+            AppError::InsufficientStorage(msg) => (
+                StatusCode::INSUFFICIENT_STORAGE,
+                json!({
+                    "error": { "code": "insufficient_storage", "message": msg }
                 }),
             ),
             AppError::TooManyRequests(msg) => (

@@ -128,6 +128,18 @@ pub struct NamespaceInfo {
     pub device_id: Option<String>,
     pub blob_size: u64,
     pub object_count: u64,
+    #[serde(default)]
+    pub object_bytes: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub growth_bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_write_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_observed_at: Option<String>,
+    #[serde(default)]
+    pub deleted_bytes: u64,
     pub format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
@@ -155,10 +167,50 @@ pub struct ApiToken {
     pub disabled_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub read_count: u64,
+    #[serde(default)]
+    pub write_count: u64,
+    #[serde(default)]
+    pub failed_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_permission: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_version: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Admin-managed device identity linked to API tokens and sync observations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRecord {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace_pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_client_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,4 +234,66 @@ pub struct LoginAttemptRecord {
 #[serde(rename_all = "camelCase")]
 pub struct DeletedNamespaceRecord {
     pub deleted_at: String,
+}
+
+/// Recent optimistic-lock conflict observed by the sync API.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncConflictRecord {
+    pub id: String,
+    pub occurred_at: String,
+    pub namespace: String,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_etag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_etag: Option<String>,
+    pub message: String,
+}
+
+/// Last known namespace storage snapshot used to show short-term growth.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NamespaceUsageRecord {
+    pub namespace: String,
+    pub observed_at: String,
+    pub blob_bytes: u64,
+    pub object_count: u64,
+    pub object_bytes: u64,
+    pub total_bytes: u64,
+    pub growth_bytes: i64,
+    pub soft_deleted: bool,
+}
+
+/// Admin panel user account. Password hashes are bcrypt values, never plaintext.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminUserRecord {
+    pub username: String,
+    pub password_hash: String,
+    pub role: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_login_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_login_ip: Option<String>,
+    #[serde(default)]
+    pub failed_login_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failed_login_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_at: Option<String>,
 }

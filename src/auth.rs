@@ -28,18 +28,22 @@ pub struct AdminClaims {
     pub sub: String,
     pub exp: usize,
     pub iat: usize,
+    #[serde(default)]
+    pub ver: u64,
 }
 
 /// Create a short-lived admin JWT (24h) for a specific admin username.
 pub fn create_admin_jwt_for_user(
     secret: &str,
     username: &str,
+    session_version: u64,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     let now = chrono::Utc::now().timestamp() as usize;
     let claims = AdminClaims {
         sub: username.to_string(),
         exp: now + 86400, // 24 hours
         iat: now,
+        ver: session_version,
     };
     encode(
         &Header::default(),
@@ -156,15 +160,16 @@ mod tests {
     #[test]
     fn admin_jwt_roundtrip() {
         let secret = "test-jwt-secret-key";
-        let token = create_admin_jwt_for_user(secret, "admin").unwrap();
+        let token = create_admin_jwt_for_user(secret, "admin", 3).unwrap();
         let claims = validate_admin_jwt(&token, secret).unwrap();
         assert_eq!(claims.sub, "admin");
+        assert_eq!(claims.ver, 3);
     }
 
     #[test]
     fn admin_jwt_uses_supplied_username() {
         let secret = "test-jwt-secret-key";
-        let token = create_admin_jwt_for_user(secret, "ops").unwrap();
+        let token = create_admin_jwt_for_user(secret, "ops", 0).unwrap();
         let claims = validate_admin_jwt(&token, secret).unwrap();
         assert_eq!(claims.sub, "ops");
     }

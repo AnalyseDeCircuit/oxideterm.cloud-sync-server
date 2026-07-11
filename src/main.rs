@@ -86,6 +86,18 @@ struct Cli {
     #[arg(long, env = "MAX_LOGIN_FAILURES", default_value = "5")]
     max_login_failures: u32,
 
+    /// Minimum seconds between persistent token usage updates for the same token.
+    #[arg(long, env = "TOKEN_USAGE_WRITE_INTERVAL_SECONDS", default_value = "60")]
+    token_usage_write_interval_seconds: i64,
+
+    /// Minimum seconds between full namespace usage recalculations during sync writes.
+    #[arg(long, env = "USAGE_REFRESH_INTERVAL_SECONDS", default_value = "60")]
+    usage_refresh_interval_seconds: i64,
+
+    /// Maximum number of recent sync conflicts retained in the database.
+    #[arg(long, env = "MAX_SYNC_CONFLICT_RECORDS", default_value = "500")]
+    max_sync_conflict_records: usize,
+
     /// Default token lifetime in seconds. Tokens created without an explicit expiresAt inherit this.
     #[arg(long, env = "DEFAULT_TOKEN_TTL_SECONDS")]
     default_token_ttl_seconds: Option<i64>,
@@ -263,25 +275,52 @@ async fn main() {
         let existing_user = database
             .get_admin_user(username)
             .expect("Failed to read admin user");
+        let password_unchanged = existing_user
+            .as_ref()
+            .is_some_and(|user| auth::verify_admin_password(password, &user.password_hash));
+        let password_hash = if password_unchanged {
+            existing_user
+                .as_ref()
+                .map(|user| user.password_hash.clone())
+                .expect("Existing admin user disappeared")
+        } else {
+            auth::hash_admin_password(password).expect("Failed to hash admin password")
+        };
+        let session_version = existing_user
+            .as_ref()
+            .map(|user| {
+                if password_unchanged {
+                    user.session_version
+                } else {
+                    user.session_version.saturating_add(1)
+                }
+            })
+            .unwrap_or(0);
         let user = AdminUserRecord {
             username: username.to_string(),
-            password_hash: auth::hash_admin_password(password)
-                .expect("Failed to hash admin password"),
+            password_hash,
             role: existing_user
                 .as_ref()
                 .map(|user| user.role.clone())
                 .unwrap_or_else(|| "admin".to_string()),
+            session_version,
             enabled: true,
             created_at: existing_user
                 .as_ref()
                 .map(|user| user.created_at.clone())
                 .unwrap_or_else(|| now.clone()),
             updated_at: now,
-            last_login_at: existing_user.and_then(|user| user.last_login_at),
+            last_login_at: existing_user
+                .as_ref()
+                .and_then(|user| user.last_login_at.clone()),
             last_login_ip: None,
             failed_login_count: 0,
             last_failed_login_at: None,
-            password_updated_at: Some(chrono::Utc::now().to_rfc3339()),
+            password_updated_at: if password_unchanged {
+                existing_user.and_then(|user| user.password_updated_at)
+            } else {
+                Some(chrono::Utc::now().to_rfc3339())
+            },
             disabled_at: None,
         };
         database
@@ -316,6 +355,9 @@ async fn main() {
         login_window_seconds: cli.login_window_seconds,
         login_lockout_seconds: cli.login_lockout_seconds,
         max_login_failures: cli.max_login_failures,
+        token_usage_write_interval_seconds: cli.token_usage_write_interval_seconds,
+        usage_refresh_interval_seconds: cli.usage_refresh_interval_seconds,
+        max_sync_conflict_records: cli.max_sync_conflict_records,
         default_token_ttl_seconds: cli.default_token_ttl_seconds,
         metadata_retention: MetadataRetentionConfig {
             store_revision: cli.store_metadata_revision,

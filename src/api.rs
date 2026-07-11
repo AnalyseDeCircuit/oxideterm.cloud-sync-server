@@ -41,6 +41,9 @@ pub struct AppState {
     pub login_window_seconds: i64,
     pub login_lockout_seconds: i64,
     pub max_login_failures: u32,
+    pub token_usage_write_interval_seconds: i64,
+    pub usage_refresh_interval_seconds: i64,
+    pub max_sync_conflict_records: usize,
     pub default_token_ttl_seconds: Option<i64>,
     pub metadata_retention: MetadataRetentionConfig,
 }
@@ -280,21 +283,39 @@ fn authorize_sync_request_with_permission(
         )));
     }
 
-    let client_ip = resolve_sync_client_ip(headers, peer_addr, state);
-    let client_version = sync_client_version(headers);
-    state
-        .db
-        .record_token_usage(
-            &token.id,
-            namespace,
-            permission.as_str(),
-            &client_ip,
-            client_version.as_deref(),
-            &chrono::Utc::now().to_rfc3339(),
-        )
-        .map_err(|e| AppError::Internal(format!("Failed to update token audit info: {e}")))?;
+    let now = chrono::Utc::now();
+    if token_usage_update_due(&token, now, state.token_usage_write_interval_seconds) {
+        let client_ip = resolve_sync_client_ip(headers, peer_addr, state);
+        let client_version = sync_client_version(headers);
+        state
+            .db
+            .record_token_usage(
+                &token.id,
+                namespace,
+                permission.as_str(),
+                &client_ip,
+                client_version.as_deref(),
+                &now.to_rfc3339(),
+            )
+            .map_err(|e| AppError::Internal(format!("Failed to update token audit info: {e}")))?;
+    }
 
     Ok(token)
+}
+
+fn token_usage_update_due(
+    token: &ApiToken,
+    now: chrono::DateTime<chrono::Utc>,
+    interval_seconds: i64,
+) -> bool {
+    if interval_seconds <= 0 {
+        return true;
+    }
+    token
+        .last_used_at
+        .as_deref()
+        .and_then(parse_rfc3339_utc)
+        .is_none_or(|last_used| (now - last_used).num_seconds() >= interval_seconds)
 }
 
 fn record_token_failure(state: &AppState, token_id: &str) -> Result<(), AppError> {
@@ -416,6 +437,9 @@ fn record_conditional_write_conflict(
     observation: ConflictObservation<'_>,
     error: &ConditionalWriteError,
 ) -> Result<(), AppError> {
+    if state.max_sync_conflict_records == 0 {
+        return Ok(());
+    }
     if let ConditionalWriteError::Conflict {
         remote_revision,
         remote_etag,
@@ -437,7 +461,7 @@ fn record_conditional_write_conflict(
         };
         state
             .db
-            .add_sync_conflict(&conflict)
+            .add_sync_conflict(&conflict, state.max_sync_conflict_records)
             .map_err(|e| AppError::Internal(format!("Failed to record sync conflict: {e}")))?;
     }
     Ok(())
@@ -576,7 +600,12 @@ async fn put_metadata(
 
     let serialized = serde_json::to_vec(&meta)?;
     state.db.set_metadata(&namespace, &serialized)?;
-    state.db.refresh_namespace_usage(&namespace, &now, false)?;
+    state.db.refresh_namespace_usage_if_stale(
+        &namespace,
+        &now,
+        false,
+        state.usage_refresh_interval_seconds,
+    )?;
 
     Ok(Json(WriteResponse {
         ok: true,
@@ -730,9 +759,12 @@ async fn put_blob(
         )?;
         return Err(map_conditional_write_error(error));
     }
-    state
-        .db
-        .refresh_namespace_usage(&namespace, &chrono::Utc::now().to_rfc3339(), false)?;
+    state.db.refresh_namespace_usage_if_stale(
+        &namespace,
+        &chrono::Utc::now().to_rfc3339(),
+        false,
+        state.usage_refresh_interval_seconds,
+    )?;
 
     Ok(Json(WriteResponse {
         ok: true,
@@ -859,9 +891,12 @@ async fn put_object(
         )?;
         return Err(map_conditional_write_error(error));
     }
-    state
-        .db
-        .refresh_namespace_usage(&namespace, &chrono::Utc::now().to_rfc3339(), false)?;
+    state.db.refresh_namespace_usage_if_stale(
+        &namespace,
+        &chrono::Utc::now().to_rfc3339(),
+        false,
+        state.usage_refresh_interval_seconds,
+    )?;
 
     Ok(Json(ObjectWriteResponse { etag: Some(etag) }))
 }
@@ -907,5 +942,37 @@ mod tests {
             retain_metadata_value(true, Some("value".to_string())),
             Some("value".to_string())
         );
+    }
+
+    #[test]
+    fn token_usage_updates_respect_persistence_interval() {
+        let now = chrono::Utc::now();
+        let mut token = ApiToken {
+            id: "tok-1".into(),
+            name: "test".into(),
+            token_hash: "hash".into(),
+            encrypted_token: None,
+            namespace_pattern: "*".into(),
+            permissions: vec!["read".into()],
+            created_at: now.to_rfc3339(),
+            enabled: true,
+            expires_at: None,
+            rotated_at: None,
+            disabled_at: None,
+            last_used_at: Some((now - chrono::Duration::seconds(30)).to_rfc3339()),
+            device_id: None,
+            read_count: 0,
+            write_count: 0,
+            failed_count: 0,
+            last_namespace: None,
+            last_permission: None,
+            last_client_ip: None,
+            last_client_version: None,
+        };
+
+        assert!(!token_usage_update_due(&token, now, 60));
+        token.last_used_at = Some((now - chrono::Duration::seconds(60)).to_rfc3339());
+        assert!(token_usage_update_due(&token, now, 60));
+        assert!(token_usage_update_due(&token, now, 0));
     }
 }

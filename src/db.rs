@@ -2,7 +2,7 @@
 
 #![allow(clippy::result_large_err)]
 
-use redb::{Database as RedbDatabase, ReadableTable, TableDefinition};
+use redb::{Database as RedbDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -417,9 +417,38 @@ impl Database {
         Ok(usage)
     }
 
+    pub fn refresh_namespace_usage_if_stale(
+        &self,
+        namespace: &str,
+        observed_at: &str,
+        soft_deleted: bool,
+        interval_seconds: i64,
+    ) -> Result<Option<NamespaceUsageRecord>, redb::Error> {
+        if interval_seconds > 0 {
+            let refresh_due = self
+                .get_namespace_usage(namespace)?
+                .and_then(|usage| {
+                    let previous = chrono::DateTime::parse_from_rfc3339(&usage.observed_at).ok()?;
+                    let current = chrono::DateTime::parse_from_rfc3339(observed_at).ok()?;
+                    Some((current - previous).num_seconds() >= interval_seconds)
+                })
+                .unwrap_or(true);
+            if !refresh_due {
+                return Ok(None);
+            }
+        }
+
+        self.refresh_namespace_usage(namespace, observed_at, soft_deleted)
+            .map(Some)
+    }
+
     // ── Sync Conflicts ──
 
-    pub fn add_sync_conflict(&self, conflict: &SyncConflictRecord) -> Result<(), redb::Error> {
+    pub fn add_sync_conflict(
+        &self,
+        conflict: &SyncConflictRecord,
+        max_records: usize,
+    ) -> Result<(), redb::Error> {
         let write_txn = self.inner.begin_write()?;
         {
             let mut table = write_txn.open_table(SYNC_CONFLICT_TABLE)?;
@@ -430,6 +459,19 @@ impl Database {
                 sync_conflict_key(&conflict.occurred_at, &conflict.id).as_str(),
                 data.as_slice(),
             )?;
+
+            // Keys begin with RFC3339 timestamps, so removing from the start keeps newest records.
+            let excess = table.len()?.saturating_sub(max_records as u64);
+            if excess > 0 {
+                let keys_to_remove = table
+                    .iter()?
+                    .take(excess as usize)
+                    .map(|entry| entry.map(|(key, _)| key.value().to_string()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for key in keys_to_remove {
+                    table.remove(key.as_str())?;
+                }
+            }
         }
         write_txn.commit()?;
         Ok(())
@@ -1003,6 +1045,7 @@ mod tests {
             username: username.to_string(),
             password_hash: "bcrypt-hash".to_string(),
             role: "admin".to_string(),
+            session_version: 0,
             enabled: true,
             created_at: now.clone(),
             updated_at: now,
@@ -1118,14 +1161,30 @@ mod tests {
     #[test]
     fn sync_conflicts_are_returned_newest_first() {
         let db = open_test_db();
-        db.add_sync_conflict(&test_conflict("old", "2026-01-01T00:00:00Z"))
+        db.add_sync_conflict(&test_conflict("old", "2026-01-01T00:00:00Z"), 100)
             .unwrap();
-        db.add_sync_conflict(&test_conflict("new", "2026-01-02T00:00:00Z"))
+        db.add_sync_conflict(&test_conflict("new", "2026-01-02T00:00:00Z"), 100)
             .unwrap();
 
         let conflicts = db.list_sync_conflicts(1).unwrap();
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].id, "new");
+    }
+
+    #[test]
+    fn sync_conflict_retention_removes_oldest_records() {
+        let db = open_test_db();
+        db.add_sync_conflict(&test_conflict("old", "2026-01-01T00:00:00Z"), 2)
+            .unwrap();
+        db.add_sync_conflict(&test_conflict("middle", "2026-01-02T00:00:00Z"), 2)
+            .unwrap();
+        db.add_sync_conflict(&test_conflict("new", "2026-01-03T00:00:00Z"), 2)
+            .unwrap();
+
+        let conflicts = db.list_sync_conflicts(10).unwrap();
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].id, "new");
+        assert_eq!(conflicts[1].id, "middle");
     }
 
     #[test]

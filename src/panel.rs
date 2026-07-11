@@ -62,7 +62,7 @@ pub fn admin_router() -> Router<Arc<AppState>> {
             delete(admin_delete_token).patch(admin_update_token),
         )
         .route("/admin/api/tokens/{id}/rotate", post(admin_rotate_token))
-        .route("/admin/api/tokens/{id}/reveal", get(admin_reveal_token))
+        .route("/admin/api/tokens/{id}/reveal", post(admin_reveal_token))
         .route(
             "/admin/api/devices",
             get(admin_list_devices).post(admin_create_device),
@@ -149,6 +149,11 @@ fn validate_admin_session(headers: &HeaderMap, state: &AppState) -> Result<Strin
         .ok_or_else(|| AppError::Unauthorized("Admin user no longer exists".to_string()))?;
     if !user.enabled {
         return Err(AppError::Unauthorized("Admin user is disabled".to_string()));
+    }
+    if claims.ver != user.session_version {
+        return Err(AppError::Unauthorized(
+            "Admin session was invalidated".to_string(),
+        ));
     }
 
     Ok(user.username)
@@ -481,13 +486,27 @@ fn record_user_login_failure(state: &AppState, user: &mut AdminUserRecord) -> Re
 // ── Admin Page (Embedded SPA) ──
 
 async fn admin_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+
     if !state.admin_enabled {
         return (
             StatusCode::NOT_FOUND,
+            headers,
             Html("Admin panel disabled".to_string()),
         );
     }
-    (StatusCode::OK, Html(ADMIN_HTML.to_string()))
+    (StatusCode::OK, headers, Html(ADMIN_HTML.to_string()))
 }
 
 // ── POST /admin/api/login ──
@@ -556,7 +575,7 @@ async fn admin_login(
     user.updated_at = chrono::Utc::now().to_rfc3339();
     state.db.set_admin_user(&user)?;
 
-    let jwt = auth::create_admin_jwt_for_user(&state.jwt_secret, &username)
+    let jwt = auth::create_admin_jwt_for_user(&state.jwt_secret, &username, user.session_version)
         .map_err(|e| AppError::Internal(format!("JWT creation failed: {e}")))?;
     let csrf = uuid::Uuid::new_v4().to_string();
     let secure_cookie = effective_admin_cookie_secure(&headers, &state);
@@ -661,6 +680,7 @@ async fn admin_change_own_password(
     let now = chrono::Utc::now().to_rfc3339();
     user.password_hash = auth::hash_admin_password(&body.new_password)
         .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}")))?;
+    user.session_version = user.session_version.saturating_add(1);
     user.password_updated_at = Some(now.clone());
     user.updated_at = now;
     state.db.set_admin_user(&user)?;
@@ -673,7 +693,18 @@ async fn admin_change_own_password(
         "Admin user changed own password"
     );
 
-    Ok(Json(serialize_admin_user(&user)))
+    // Keep the current browser signed in while every older session is invalidated.
+    let jwt = auth::create_admin_jwt_for_user(&state.jwt_secret, &username, user.session_version)
+        .map_err(|e| AppError::Internal(format!("JWT creation failed: {e}")))?;
+    let cookie = build_admin_session_cookie(&jwt, effective_admin_cookie_secure(&headers, &state));
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        "set-cookie",
+        HeaderValue::from_str(&cookie)
+            .map_err(|e| AppError::Internal(format!("Invalid session cookie: {e}")))?,
+    );
+
+    Ok((response_headers, Json(serialize_admin_user(&user))))
 }
 
 // ── Admin Users ──
@@ -738,6 +769,7 @@ async fn admin_create_user(
         password_hash: auth::hash_admin_password(&body.password)
             .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}")))?,
         role: "admin".to_string(),
+        session_version: 0,
         enabled: body.enabled.unwrap_or(true),
         created_at: now.clone(),
         updated_at: now,
@@ -782,6 +814,7 @@ async fn admin_update_user(
         .ok_or_else(|| AppError::NotFound(format!("Admin user '{}' not found", username)))?;
 
     let password_changed = body.password.is_some();
+    let enabled_changed = body.enabled.is_some_and(|enabled| enabled != user.enabled);
     if let Some(password) = body.password {
         if password.len() < 8 {
             return Err(AppError::BadRequest(
@@ -805,6 +838,9 @@ async fn admin_update_user(
         } else {
             Some(chrono::Utc::now().to_rfc3339())
         };
+    }
+    if password_changed || enabled_changed {
+        user.session_version = user.session_version.saturating_add(1);
     }
     user.updated_at = chrono::Utc::now().to_rfc3339();
     state.db.set_admin_user(&user)?;
@@ -1323,7 +1359,7 @@ async fn admin_reveal_token(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Result<impl IntoResponse, AppError> {
-    verify_admin(&headers, &state)?;
+    verify_admin_mutation(&headers, &state)?;
     let client_ip = resolve_client_ip(&headers, addr.ip(), &state);
 
     let token = state
@@ -1644,10 +1680,15 @@ async fn admin_stats(
             .iter()
             .map(|(namespace, _)| namespace.as_str()),
     ) {
-        let blob_size = state.db.blob_size(namespace)?;
-        let (_, object_bytes, _) = state.db.namespace_object_stats(namespace)?;
-        namespace_storage_bytes =
-            namespace_storage_bytes.saturating_add(blob_size.saturating_add(object_bytes));
+        let total_bytes = if let Some(usage) = state.db.get_namespace_usage(namespace)? {
+            usage.total_bytes
+        } else {
+            // Existing databases may not have a usage snapshot until the namespace is written.
+            let blob_size = state.db.blob_size(namespace)?;
+            let (_, object_bytes, _) = state.db.namespace_object_stats(namespace)?;
+            blob_size.saturating_add(object_bytes)
+        };
+        namespace_storage_bytes = namespace_storage_bytes.saturating_add(total_bytes);
     }
 
     Ok(Json(json!({
@@ -1664,7 +1705,7 @@ async fn admin_stats(
         "encryptionEnabled": encrypted,
         "tokenRevealPersistent": state.token_reveal_persistent,
         "jwtSecretPersistent": state.admin_jwt_secret_persistent,
-        "adminCookieSecure": state.admin_cookie_secure,
+        "adminCookieSecure": effective_admin_cookie_secure(&headers, &state),
         "dbWritable": db_writable,
         "dbSizeBytes": db_size_bytes,
         "diskFreeBytes": disk_free_bytes,
@@ -1694,6 +1735,9 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OxideTerm Cloud Sync — Admin</title>
 <style>
+  /* Hallmark · application shell · tone: technical · anchor hue: rust
+   * pre-emit critique: P4 H4 E4 S5 R5 V4 · contrast: pass (40-41)
+   */
   :root {
     --ot-bg-page: #f8f4eb;
     --ot-bg-surface: #f0eadd;
@@ -1701,12 +1745,17 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     --ot-border: #d4cbbf;
     --ot-text-primary: #2a2118;
     --ot-text-secondary: #5c4f3e;
-    --ot-text-muted: #8c7f6e;
+    --ot-text-muted: #6e6253;
     --ot-accent: #b7410e;
     --ot-accent-hover: #9e3a0c;
+    --ot-accent-ink: #fffaf2;
     --ot-green: #2d6a30;
     --ot-red: #9e2a1f;
-    --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --ot-green-surface: #d4edda;
+    --ot-red-surface: #f8d7da;
+    --ot-shadow: rgba(42, 33, 24, 0.12);
+    --font-display: 'Iowan Old Style', 'Palatino Linotype', 'Book Antiqua', serif;
+    --font-sans: 'Avenir Next', Avenir, 'Segoe UI', sans-serif;
     --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
   }
   @media (prefers-color-scheme: dark) {
@@ -1717,17 +1766,22 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
       --ot-border: #3d3630;
       --ot-text-primary: #e8e0d4;
       --ot-text-secondary: #b0a494;
-      --ot-text-muted: #7a6e60;
+      --ot-text-muted: #a99c8d;
+      --ot-green-surface: #1a3d1e;
+      --ot-red-surface: #3d1a1a;
+      --ot-shadow: rgba(0, 0, 0, 0.28);
     }
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { overflow-x: clip; }
   body {
     font-family: var(--font-sans);
     background: var(--ot-bg-page);
     color: var(--ot-text-primary);
-    min-height: 100vh;
+    min-height: 100dvh;
   }
   .container { max-width: 1120px; margin: 0 auto; padding: 2rem 1.5rem; }
+  h1, h2 { font-family: var(--font-display); font-style: normal; overflow-wrap: anywhere; min-width: 0; }
   h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.25rem; }
   .subtitle { color: var(--ot-text-muted); font-size: 0.875rem; margin-bottom: 2rem; }
   .card {
@@ -1763,7 +1817,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
   .stat-link:hover,
   .stat-link:focus {
     transform: translateY(-1px);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.08);
+    box-shadow: 0 4px 14px var(--ot-shadow);
     outline: 2px solid var(--ot-accent);
     outline-offset: 2px;
   }
@@ -1772,6 +1826,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     font-weight: 700;
     font-family: var(--font-mono);
     color: var(--ot-accent);
+    font-variant-numeric: tabular-nums;
   }
   .stat-label {
     font-size: 0.75rem;
@@ -1786,7 +1841,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     flex-wrap: wrap;
     margin-top: 1rem;
   }
-  table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.875rem; font-variant-numeric: tabular-nums; }
   th { text-align: left; padding: 0.5rem; color: var(--ot-text-muted); font-weight: 500; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--ot-border); }
   td { padding: 0.625rem 0.5rem; border-bottom: 1px solid var(--ot-border); vertical-align: top; }
   tr:last-child td { border-bottom: none; }
@@ -1798,12 +1853,12 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     font-size: 0.6875rem;
     font-weight: 500;
   }
-  .badge-green { background: #d4edda; color: var(--ot-green); }
-  .badge-red { background: #f8d7da; color: var(--ot-red); }
+  .badge-green { background: var(--ot-green-surface); color: var(--ot-green); }
+  .badge-red { background: var(--ot-red-surface); color: var(--ot-red); }
   .badge-muted { background: var(--ot-bg-elevated); color: var(--ot-text-muted); }
   @media (prefers-color-scheme: dark) {
-    .badge-green { background: #1a3d1e; }
-    .badge-red { background: #3d1a1a; }
+    .badge-green { color: #a8d9aa; }
+    .badge-red { color: #f2aaa2; }
   }
   .btn {
     display: inline-flex;
@@ -1817,19 +1872,29 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     font-size: 0.8125rem;
     font-family: inherit;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: background-color 0.15s, color 0.15s, border-color 0.15s, transform 0.15s;
     margin-right: 0.25rem;
     margin-bottom: 0.25rem;
+    white-space: nowrap;
   }
   .btn:hover { background: var(--ot-bg-elevated); }
+  .btn:focus-visible,
+  .admin-nav a:focus-visible,
+  input:focus-visible,
+  select:focus-visible {
+    outline: 2px solid var(--ot-accent);
+    outline-offset: 2px;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn:disabled { cursor: not-allowed; opacity: 0.55; }
   .btn-primary {
     background: var(--ot-accent);
-    color: #fff;
+    color: var(--ot-accent-ink);
     border-color: var(--ot-accent);
   }
   .btn-primary:hover { background: var(--ot-accent-hover); }
   .btn-danger { color: var(--ot-red); }
-  .btn-danger:hover { background: #f8d7da; }
+  .btn-danger:hover { background: var(--ot-red-surface); }
   .btn-sm { padding: 0.25rem 0.625rem; font-size: 0.75rem; }
   input[type="text"], input[type="password"], input[type="datetime-local"], select {
     width: 100%;
@@ -1841,7 +1906,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     font-size: 0.875rem;
     font-family: inherit;
   }
-  input:focus { outline: 2px solid var(--ot-accent); outline-offset: -1px; }
+  input:hover, select:hover { border-color: var(--ot-text-muted); }
   .form-group { margin-bottom: 1rem; }
   .form-group label { display: block; font-size: 0.8125rem; color: var(--ot-text-secondary); margin-bottom: 0.25rem; font-weight: 500; }
   .form-row { display: flex; gap: 1rem; }
@@ -1872,7 +1937,7 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     display: flex;
     align-items: center;
     justify-content: center;
-    min-height: 100vh;
+    min-height: 100dvh;
   }
   .login-card {
     background: var(--ot-bg-surface);
@@ -1906,16 +1971,43 @@ const ADMIN_HTML: &str = r##"<!DOCTYPE html>
     padding: 0.4rem 0.8rem;
     font-size: 0.8125rem;
     background: var(--ot-bg-surface);
+    white-space: nowrap;
   }
   .admin-nav a:hover,
   .admin-nav a.active {
-    color: #fff;
+    color: var(--ot-accent-ink);
     background: var(--ot-accent);
     border-color: var(--ot-accent);
   }
   .hidden { display: none; }
   .flex-between { display: flex; justify-content: space-between; align-items: center; }
   .mb-1 { margin-bottom: 1rem; }
+  #users-table,
+  #tokens-table,
+  #conflicts-table,
+  #devices-table,
+  #namespaces-table {
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+  }
+  @media (max-width: 40rem) {
+    .container { padding: 1rem; }
+    .header, .flex-between, .form-row { align-items: stretch; flex-direction: column; }
+    .header { gap: 0.75rem; margin-bottom: 1.25rem; }
+    .card { padding: 1rem; }
+    .admin-nav { flex-wrap: nowrap; overflow-x: auto; padding-bottom: 0.25rem; }
+    .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .login-card { margin: 1rem; padding: 1.5rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+    }
+  }
 </style>
 </head>
 <body>
@@ -2128,6 +2220,7 @@ let userCache = [];
 let tokenCache = [];
 let deviceCache = [];
 const validPages = new Set(['overview', 'users', 'tokens', 'conflicts', 'devices', 'namespaces']);
+const pageLoadPromises = new Map();
 
 bootstrap();
 
@@ -2170,6 +2263,7 @@ function showPage(page, opts = {}) {
   if (opts.updateHash !== false && window.location.hash !== `#${targetPage}`) {
     window.location.hash = targetPage;
   }
+  void ensurePageLoaded(targetPage);
 }
 
 window.addEventListener('hashchange', () => {
@@ -2188,12 +2282,29 @@ document.querySelectorAll('.stat-link').forEach((item) => {
 });
 
 async function loadAll() {
-  await loadStats();
-  await loadUsers();
-  await loadTokens();
-  await loadConflicts();
-  await loadDevices();
-  await loadNamespaces();
+  await ensurePageLoaded(pageFromHash());
+}
+
+async function ensurePageLoaded(page) {
+  if (pageLoadPromises.has(page)) return pageLoadPromises.get(page);
+  const loaders = {
+    overview: loadStats,
+    users: loadUsers,
+    tokens: loadLinkedInventory,
+    conflicts: loadConflicts,
+    devices: loadLinkedInventory,
+    namespaces: loadNamespaces,
+  };
+  const loadPromise = loaders[page]().catch((error) => {
+    pageLoadPromises.delete(page);
+    throw error;
+  });
+  pageLoadPromises.set(page, loadPromise);
+  return loadPromise;
+}
+
+async function loadLinkedInventory() {
+  await Promise.all([loadTokens(), loadDevices()]);
 }
 
 async function logout() {
@@ -2205,6 +2316,7 @@ async function logout() {
   userCache = [];
   tokenCache = [];
   deviceCache = [];
+  pageLoadPromises.clear();
   showLogin();
 }
 
@@ -2252,6 +2364,7 @@ async function api(path, opts = {}) {
     headers,
   });
   if (res.status === 401 && !allowUnauthorized) {
+    pageLoadPromises.clear();
     showLogin();
   }
   return res;
@@ -2502,7 +2615,7 @@ async function toggleTokenReveal(id) {
     await loadTokens();
     return;
   }
-  const res = await api(`/tokens/${id}/reveal`);
+  const res = await api(`/tokens/${id}/reveal`, { method: 'POST' });
   const data = await res.json();
   if (!res.ok) {
     alert(data.error?.message || 'Failed to reveal token');
@@ -2766,7 +2879,7 @@ async function loadNamespaces() {
     <tbody>${nss.map(n => `<tr>
       <td class="mono">${esc(n.namespace)}</td>
       <td>${n.deletedAt ? badge('Soft deleted', 'red') : badge('Active', 'green')}</td>
-      <td><span class="badge ${n.format ? 'badge-green' : 'badge-muted'}">${n.format || 'legacy'}</span></td>
+      <td><span class="badge ${n.format ? 'badge-green' : 'badge-muted'}">${esc(n.format || 'legacy')}</span></td>
       <td>${formatBytes(n.totalBytes)} ${renderGrowth(n.growthBytes)}<div class="mono">blob ${formatBytes(n.blobSize)} / objects ${formatBytes(n.objectBytes)}</div>${n.deletedBytes ? `<div class="mono">deleted ${formatBytes(n.deletedBytes)}</div>` : ''}${n.storageObservedAt ? `<div class="mono">observed ${new Date(n.storageObservedAt).toLocaleString()}</div>` : ''}</td>
       <td>${n.objectCount}</td>
       <td>${n.lastWriteAt ? new Date(n.lastWriteAt).toLocaleString() : '-'}</td>
@@ -2910,6 +3023,9 @@ mod tests {
             login_window_seconds: 900,
             login_lockout_seconds: 900,
             max_login_failures: 5,
+            token_usage_write_interval_seconds: 60,
+            usage_refresh_interval_seconds: 60,
+            max_sync_conflict_records: 500,
             default_token_ttl_seconds: None,
             metadata_retention: MetadataRetentionConfig {
                 store_revision: true,
@@ -2972,6 +3088,7 @@ mod tests {
             username: "ops".to_string(),
             password_hash: "hash".to_string(),
             role: "admin".to_string(),
+            session_version: 0,
             enabled: true,
             created_at: now.clone(),
             updated_at: now,
@@ -2988,6 +3105,39 @@ mod tests {
 
         assert_eq!(stored.failed_login_count, 1);
         assert!(stored.last_failed_login_at.is_some());
+    }
+
+    #[test]
+    fn session_version_invalidates_existing_admin_session() {
+        let state = test_state(true, false);
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut user = AdminUserRecord {
+            username: "ops".to_string(),
+            password_hash: "hash".to_string(),
+            role: "admin".to_string(),
+            session_version: 1,
+            enabled: true,
+            created_at: now.clone(),
+            updated_at: now,
+            last_login_at: None,
+            last_login_ip: None,
+            failed_login_count: 0,
+            last_failed_login_at: None,
+            password_updated_at: None,
+            disabled_at: None,
+        };
+        state.db.set_admin_user(&user).unwrap();
+        let jwt = auth::create_admin_jwt_for_user(&state.jwt_secret, "ops", 1).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("{ADMIN_COOKIE_NAME}={jwt}")).unwrap(),
+        );
+
+        assert_eq!(validate_admin_session(&headers, &state).unwrap(), "ops");
+        user.session_version = 2;
+        state.db.set_admin_user(&user).unwrap();
+        assert!(validate_admin_session(&headers, &state).is_err());
     }
 
     #[test]

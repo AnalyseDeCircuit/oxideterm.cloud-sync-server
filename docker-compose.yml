@@ -37,6 +37,9 @@ services:
       # - MAX_BLOB_SIZE=67108864   # 64 MiB
       # - MAX_OBJECT_SIZE=16777216 # 16 MiB
       # - MIN_FREE_DISK_BYTES=104857600 # 100 MiB
+      # - TOKEN_USAGE_WRITE_INTERVAL_SECONDS=60 # Set to 0 for exact per-request counters
+      # - USAGE_REFRESH_INTERVAL_SECONDS=60
+      # - MAX_SYNC_CONFLICT_RECORDS=500
 
       # Optional: log level
       - RUST_LOG=oxideterm_cloud_sync_server=info,tower_http=info

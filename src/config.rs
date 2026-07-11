@@ -280,6 +280,9 @@ pub struct AdminUserRecord {
     pub username: String,
     pub password_hash: String,
     pub role: String,
+    /// Incrementing this value invalidates every previously issued session.
+    #[serde(default)]
+    pub session_version: u64,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub created_at: String,

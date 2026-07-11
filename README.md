@@ -125,6 +125,9 @@ Recovery drill:
 | `LOGIN_WINDOW_SECONDS` | `--login-window-seconds` | `900` | Failed-login observation window |
 | `LOGIN_LOCKOUT_SECONDS` | `--login-lockout-seconds` | `900` | Temporary admin lockout duration after repeated failures |
 | `MAX_LOGIN_FAILURES` | `--max-login-failures` | `5` | Failure threshold before lockout |
+| `TOKEN_USAGE_WRITE_INTERVAL_SECONDS` | `--token-usage-write-interval-seconds` | `60` | Minimum interval between persistent usage updates per token; `0` records every request |
+| `USAGE_REFRESH_INTERVAL_SECONDS` | `--usage-refresh-interval-seconds` | `60` | Minimum interval between full namespace usage recalculations during sync writes; `0` recalculates every write |
+| `MAX_SYNC_CONFLICT_RECORDS` | `--max-sync-conflict-records` | `500` | Maximum recent ETag conflict records retained; `0` disables conflict recording |
 | `DEFAULT_TOKEN_TTL_SECONDS` | `--default-token-ttl-seconds` | *(none)* | Default lifetime applied to newly created tokens without `expiresAt` |
 | `STORE_METADATA_REVISION` | `--store-metadata-revision` | `true` | Persist the metadata `revision` field |
 | `STORE_METADATA_UPLOADED_AT` | `--store-metadata-uploaded-at` | `true` | Persist the metadata `uploadedAt` field |
@@ -165,8 +168,8 @@ When `ENCRYPTION_KEY` is *not* set:
 
 - API tokens are still authenticated by SHA-256 hash lookup; newly created tokens also keep an encrypted copy so the admin panel can reveal them later
 - Each token is scoped to a namespace pattern (`*`, `exact`, or `prefix*`), supports explicit `read` / `write` permissions, can be disabled, rotated, or assigned an `expiresAt`
-- Token usage profiling records operational metadata only: read/write/failure counts, last namespace, last client IP, last client version, and last use time. It does not record plaintext tokens, passwords, or synced payload content.
-- Sync conflict tracking records recent ETag conflicts with namespace, operation, optional object path, device ID, requested/remote revisions, and requested/remote ETags. It does not store payload content.
+- Token usage profiling records sampled operational metadata only: read/write/failure counters, last namespace, last client IP, last client version, and last use time. The default 60-second write interval reduces disk wakeups, so read/write counters are operational trends rather than exact request totals. It does not record plaintext tokens, passwords, or synced payload content.
+- Sync conflict tracking records a bounded set of recent ETag conflicts with namespace, operation, optional object path, device ID, requested/remote revisions, and requested/remote ETags. It does not store payload content.
 - Device records are an admin-managed inventory layer. They can be linked to tokens and updated from sync observations, but they do not add a second authentication factor yet.
 - Admin users are stored in redb with bcrypt password hashes; `ADMIN_PASSWORD` bootstraps or updates the configured `ADMIN_USERNAME`
 - Admin user records track operational security metadata such as last login time, last login IP, failed login count, last failed login time, and password update time
@@ -238,7 +241,7 @@ When `ENCRYPTION_KEY` is *not* set:
 | `POST` | `/admin/api/tokens` | Create API token |
 | `PATCH` | `/admin/api/tokens/:id` | Update `enabled` / `expiresAt` / `deviceId` |
 | `POST` | `/admin/api/tokens/:id/rotate` | Rotate an API token and return the new secret |
-| `GET` | `/admin/api/tokens/:id/reveal` | Reveal an existing API token |
+| `POST` | `/admin/api/tokens/:id/reveal` | Reveal an existing API token with CSRF protection |
 | `DELETE` | `/admin/api/tokens/:id` | Delete API token |
 | `GET` | `/admin/api/devices` | List registered devices |
 | `POST` | `/admin/api/devices` | Register a device record |
@@ -253,7 +256,7 @@ This software is a **self-hosted data synchronization intermediary** designed ex
 - **No content inspection.** The server stores opaque blob/object payloads and plaintext metadata for synchronization bookkeeping. It does not parse, display, or redistribute user data to third parties.
 - **No outbound connections.** The server makes no connections to external services. All data resides on the deployer's own infrastructure.
 - **User responsibility.** Users must not use this software to store or transmit content that violates applicable laws and regulations. Deployers are responsible for complying with the laws of their jurisdiction, including but not limited to data protection, cybersecurity, and encryption regulations.
-- **Commercial encryption.** The cryptographic algorithms used (ChaCha20-Poly1305, SHA-256, bcrypt) are employed solely for protecting the deployer's own data. This software is not a commercial encryption product or service.
+- **Encryption compliance.** Whether a deployment is regulated as an encryption product or service depends on its jurisdiction, users, and operating model. Deployers should obtain qualified legal advice before public or commercial operation.
 - **No warranty.** This software is provided "as-is" without warranty of any kind. The author assumes no liability for any legal consequences arising from the use of this software.
 
 ## License

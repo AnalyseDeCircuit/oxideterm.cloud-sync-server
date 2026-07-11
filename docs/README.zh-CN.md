@@ -124,6 +124,9 @@ cargo build --release
 | `LOGIN_WINDOW_SECONDS` | `--login-window-seconds` | `900` | 登录失败统计窗口 |
 | `LOGIN_LOCKOUT_SECONDS` | `--login-lockout-seconds` | `900` | 超过阈值后的临时锁定时长 |
 | `MAX_LOGIN_FAILURES` | `--max-login-failures` | `5` | 触发锁定前允许的最大失败次数 |
+| `TOKEN_USAGE_WRITE_INTERVAL_SECONDS` | `--token-usage-write-interval-seconds` | `60` | 同一 Token 两次持久化用量更新的最短间隔；设为 `0` 时逐请求记录 |
+| `USAGE_REFRESH_INTERVAL_SECONDS` | `--usage-refresh-interval-seconds` | `60` | 同步写入触发命名空间完整用量重算的最短间隔；设为 `0` 时逐次重算 |
+| `MAX_SYNC_CONFLICT_RECORDS` | `--max-sync-conflict-records` | `500` | 最多保留的近期 ETag 冲突记录数；设为 `0` 时不记录冲突 |
 | `DEFAULT_TOKEN_TTL_SECONDS` | `--default-token-ttl-seconds` | *(空)* | 对未显式指定 `expiresAt` 的新 Token 自动套用默认有效期 |
 | `STORE_METADATA_REVISION` | `--store-metadata-revision` | `true` | 是否持久化元数据中的 `revision` |
 | `STORE_METADATA_UPLOADED_AT` | `--store-metadata-uploaded-at` | `true` | 是否持久化元数据中的 `uploadedAt` |
@@ -164,8 +167,8 @@ cargo build --release
 
 - API Token 仍通过 SHA-256 散列进行鉴权；新创建的 Token 会额外保存一份加密副本，便于管理面板后续回显
 - 每个 Token 可限定到命名空间模式（`*` 全部、精确匹配、`前缀*`），支持 `read` / `write` 权限、过期时间、启用/禁用与轮换
-- Token 使用画像只记录运营元数据：读/写/失败次数、最近命名空间、最近客户端 IP、最近客户端版本与最近使用时间；不会记录明文 Token、密码或同步载荷内容
-- 同步冲突追踪只记录最近 ETag 冲突的命名空间、操作、可选对象路径、设备 ID、请求/远端 revision 和请求/远端 ETag；不会保存同步载荷内容
+- Token 使用画像只记录采样后的运营元数据：读/写/失败次数、最近命名空间、最近客户端 IP、最近客户端版本与最近使用时间。默认 60 秒写盘间隔用于减少磁盘唤醒，因此读写计数表示运营趋势而非逐请求精确总数；不会记录明文 Token、密码或同步载荷内容
+- 同步冲突追踪仅有界保留近期 ETag 冲突的命名空间、操作、可选对象路径、设备 ID、请求/远端 revision 和请求/远端 ETag；不会保存同步载荷内容
 - 设备记录是管理后台的资产清单层，可关联 Token，并由同步观测更新 last seen；它目前不是第二认证因子
 - 管理员用户存储在 redb 中，密码以 bcrypt hash 保存；`ADMIN_PASSWORD` 会引导或更新配置的 `ADMIN_USERNAME`
 - 管理员用户会记录运营安全元数据，包括最近登录时间、最近登录 IP、登录失败次数、最近失败时间和密码更新时间
@@ -237,7 +240,7 @@ cargo build --release
 | `POST` | `/admin/api/tokens` | 创建 API Token |
 | `PATCH` | `/admin/api/tokens/:id` | 更新 `enabled` / `expiresAt` / `deviceId` |
 | `POST` | `/admin/api/tokens/:id/rotate` | 轮换 API Token 并返回新的密钥 |
-| `GET` | `/admin/api/tokens/:id/reveal` | 回显已有 API Token |
+| `POST` | `/admin/api/tokens/:id/reveal` | 在 CSRF 保护下回显已有 API Token |
 | `DELETE` | `/admin/api/tokens/:id` | 删除 API Token |
 | `GET` | `/admin/api/devices` | 列出已登记设备 |
 | `POST` | `/admin/api/devices` | 登记设备记录 |
@@ -266,7 +269,7 @@ cargo build --release
 
 ### 加密合规
 
-本软件使用的加密算法（ChaCha20-Poly1305、SHA-256、bcrypt）仅用于保护部署者自身的数据安全，属于《密码法》第二十一条规定的"公民、法人和其他组织依法使用商用密码保护网络与信息安全"范畴。本软件不属于商用密码产品，不提供面向他人的加密服务。
+本软件使用 ChaCha20-Poly1305、SHA-256、bcrypt 保护数据。具体部署是否构成受监管的商用密码产品或服务，取决于所在司法辖区、服务对象和经营模式；公开或商业化运营前，部署者应结合实际业务取得具备资质的法律意见。
 
 ### 出口合规
 

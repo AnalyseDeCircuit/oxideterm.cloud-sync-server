@@ -1,10 +1,9 @@
 // Copyright (C) 2026 AnalyseDeCircuit. Licensed under AGPL-3.0-or-later.
 
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, OsRng},
+    aead::{Aead, AeadCore, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
 };
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 /// Parse a 32-byte hex-encoded key.
@@ -30,16 +29,14 @@ pub fn derive_key(secret_material: &[u8]) -> [u8; 32] {
 /// Returns: nonce (12 bytes) || ciphertext (with 16-byte auth tag appended).
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let cipher = ChaCha20Poly1305::new(key.into());
-    let mut nonce_bytes = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| format!("Encryption failed: {e}"))?;
 
     let mut result = Vec::with_capacity(12 + ciphertext.len());
-    result.extend_from_slice(&nonce_bytes);
+    result.extend_from_slice(&nonce);
     result.extend_from_slice(&ciphertext);
     Ok(result)
 }

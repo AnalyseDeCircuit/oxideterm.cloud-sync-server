@@ -11,7 +11,10 @@ RUN cp target/x86_64-unknown-linux-musl/release/oxideterm-cloud-sync-server /bui
 
 # ── Runtime stage ──
 FROM alpine:3.21
-RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tini
+# The static server needs the CA bundle, not apk's OpenSSL libraries or certificate tools.
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates-bundle tini \
+    && apk del apk-tools
 RUN addgroup -S oxideterm && adduser -S oxideterm -G oxideterm
 
 # Data volume

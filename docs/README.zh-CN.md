@@ -7,7 +7,7 @@
 ## 特性
 
 - **可选静态数据加密** — 使用 ChaCha20-Poly1305 AEAD，加密密钥由您自行掌控。设置 `ENCRYPTION_KEY` 后，blob 和 object 载荷会在落盘前加密。
-- **结构化同步协议** — 完整支持 OxideTerm Cloud Sync 插件的 `structured-v1` 协议。连接、转发、设置等配置以独立对象存储，支持增量同步。
+- **云同步协议** — 支持 v3 加密 `.oxide` 快照、对象分页查询和清理，同时保留 `structured-v1` 的元数据、快照和对象接口。
 - **并发控制** — 基于 ETag 的乐观锁机制覆盖 blob 与 object 上传，防止多设备同时上传时数据丢失。
 - **作用域 API Token** — Token 仍通过 SHA-256 散列校验，同时支持过期时间、启用/禁用、轮换、后台回显、设备绑定与使用计数。
 - **管理后台** — 内嵌 SPA 管理面板，支持管理员用户、Token、设备、命名空间容量、同步冲突与生命周期管理。bcrypt 密码 + HttpOnly Cookie 会话保护，并带持久化登录限速与审计日志。
@@ -20,7 +20,7 @@
 | 维度 | 自建部署（本服务器） | 第三方/通用同步方案 |
 | --- | --- | --- |
 | 静态加密 | ChaCha20-Poly1305，密钥自持 | 因方案而异，常为明文 |
-| 协议支持 | 完整 `structured-v1`，按节对象 | 通常仅支持单 blob |
+| 协议支持 | v3 `.oxide` 快照及 `structured-v1` 对象 | 取决于服务商 |
 | 并发控制 | 基于 ETag 乐观锁 | 少有支持 |
 | Token 作用域 | 按命名空间模式匹配 | 通常为单一全局密钥 |
 | 管理后台 | 内嵌 SPA | 需外部工具 |
@@ -64,6 +64,21 @@ docker compose up -d
 ```
 
 如果你是从源码仓库直接构建镜像，使用 `docker compose build && docker compose up -d`。
+
+### 升级以支持云同步 v3
+
+新版客户端需要下面列出的对象分页查询和删除接口。如果客户端提示
+`sync_protocol_upgrade_required`，请将服务器更新到包含这些接口的构建版本。
+数据库无需转换，原有快照、对象和令牌继续保存在同一个 redb 数据库中。
+
+保留原来的数据卷和 `ENCRYPTION_KEY`。获取更新后的源码后，重新构建并替换服务：
+
+```bash
+docker compose up -d --build sync-server
+```
+
+如果使用镜像仓库部署，需要先等待支持 v3 的镜像发布，将 `IMAGE_TAG` 设置为对应标签，
+再执行 `docker compose pull sync-server` 和 `docker compose up -d --no-build sync-server`。
 
 ### 从源码构建
 
@@ -212,10 +227,19 @@ cargo build --release
 | `PUT` | `/v1/namespaces/:ns/metadata` | 更新同步元数据 |
 | `GET` | `/v1/namespaces/:ns/blob` | 下载快照 blob |
 | `PUT` | `/v1/namespaces/:ns/blob` | 上传快照 blob（ETag 并发控制） |
+| `GET` | `/v1/namespaces/:ns/objects?prefix=sync-v3/` | 按前缀分页查询对象路径 |
 | `GET` | `/v1/namespaces/:ns/objects/*path` | 下载结构化对象，并返回 `ETag` |
 | `PUT` | `/v1/namespaces/:ns/objects/*path` | 上传结构化对象，支持 `If-Match` / `If-None-Match` |
+| `DELETE` | `/v1/namespaces/:ns/objects/*path` | 删除对象及其 ETag；对象不存在时也返回 `204` |
 | `GET` | `/health` | 健康检查（无需认证） |
 | `GET` | `/ready` | 就绪检查（包含数据库与关键配置状态） |
+
+对象列表需要读取权限，返回格式为
+`{"objects":[{"path":"sync-v3/device/snapshot.oxide"}],"nextCursor":null}`。
+路径按字典序排列。`prefix` 默认为空，`limit` 默认为 256，允许范围为 1–256。
+`nextCursor` 非空时，将其值进行 URL 编码后作为 `cursor` 参数传入，并保持相同的前缀，
+即可读取下一页。空命名空间返回空数组和 `200` 状态码。每页反映该次请求时的数据库内容。
+删除需要写入权限；所有操作均检查令牌的命名空间权限，并拒绝访问已软删除的命名空间。
 
 ### 管理 API（需要管理员会话 Cookie）
 

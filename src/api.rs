@@ -2,12 +2,13 @@
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Redirect},
     routing::get,
     Json, Router,
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::{ffi::CString, net::SocketAddr, sync::Arc};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -66,9 +67,10 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(shared.max_blob_size));
 
     let object_api = Router::new()
+        .route("/v1/namespaces/{namespace}/objects", get(list_objects))
         .route(
             "/v1/namespaces/{namespace}/objects/{*path}",
-            get(get_object).put(put_object),
+            get(get_object).put(put_object).delete(delete_object),
         )
         .layer(DefaultBodyLimit::max(shared.max_object_size));
 
@@ -98,7 +100,7 @@ fn build_sync_cors_layer(origins: &[String]) -> Option<CorsLayer> {
     }
 
     let layer = CorsLayer::new()
-        .allow_methods([Method::GET, Method::PUT, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::PUT, Method::DELETE, Method::OPTIONS])
         .allow_headers(Any);
 
     if origins.iter().any(|origin| origin == "*") {
@@ -775,6 +777,89 @@ async fn put_blob(
     }))
 }
 
+#[derive(Deserialize)]
+struct ObjectListQuery {
+    #[serde(default)]
+    prefix: String,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn list_objects(
+    State(state): State<Arc<AppState>>,
+    Path(namespace): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<ObjectListQuery>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    let namespace = decode_namespace(&namespace)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Read,
+        addr,
+    )?;
+    let limit = query.limit.unwrap_or(256);
+    if !(1..=256).contains(&limit)
+        || query.prefix.len() > 1024
+        || query.prefix.chars().any(char::is_control)
+        || query.cursor.as_ref().is_some_and(|cursor| {
+            cursor.is_empty()
+                || cursor.len() > 1024
+                || cursor.chars().any(char::is_control)
+                || !cursor.starts_with(&query.prefix)
+        })
+    {
+        return Err(AppError::BadRequest(
+            "Invalid object listing parameters".into(),
+        ));
+    }
+    let mut paths = state.db.list_object_paths(
+        &namespace,
+        &query.prefix,
+        query.cursor.as_deref(),
+        limit + 1,
+    )?;
+    let next_cursor = if paths.len() > limit {
+        paths.truncate(limit);
+        paths.last().cloned()
+    } else {
+        None
+    };
+    let objects: Vec<_> = paths
+        .into_iter()
+        .map(|path| json!({"path": path}))
+        .collect();
+    Ok(Json(json!({"objects": objects, "nextCursor": next_cursor})))
+}
+
+async fn delete_object(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, obj_path)): Path<(String, String)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    let namespace = decode_namespace(&namespace)?;
+    authorize_sync_request_with_permission(
+        &headers,
+        &state,
+        &namespace,
+        SyncPermission::Write,
+        addr,
+    )?;
+    let decoded_path = decode_object_path(&obj_path)?;
+    if state.db.delete_object(&namespace, &decoded_path)? {
+        state.db.refresh_namespace_usage_if_stale(
+            &namespace,
+            &chrono::Utc::now().to_rfc3339(),
+            false,
+            state.usage_refresh_interval_seconds,
+        )?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── GET /v1/namespaces/:namespace/objects/*path ──
 
 async fn get_object(
@@ -900,6 +985,10 @@ async fn put_object(
 
     Ok(Json(ObjectWriteResponse { etag: Some(etag) }))
 }
+
+#[cfg(test)]
+#[path = "api_object_tests.rs"]
+mod object_tests;
 
 #[cfg(test)]
 mod tests {

@@ -997,7 +997,12 @@ async fn admin_create_namespace(
             namespace
         )));
     }
-    if state.db.get_metadata(&namespace)?.is_some() {
+    if state.db.get_metadata(&namespace)?.is_some()
+        || !state
+            .db
+            .list_object_paths(&namespace, "", None, 1)?
+            .is_empty()
+    {
         return Err(AppError::BadRequest(format!(
             "Namespace '{}' already exists",
             namespace
@@ -1056,7 +1061,12 @@ async fn admin_delete_namespace(
             namespace
         )));
     }
-    if state.db.get_metadata(&namespace)?.is_none() {
+    if state.db.get_metadata(&namespace)?.is_none()
+        && state
+            .db
+            .list_object_paths(&namespace, "", None, 1)?
+            .is_empty()
+    {
         return Err(AppError::NotFound(format!(
             "Namespace '{}' not found",
             namespace

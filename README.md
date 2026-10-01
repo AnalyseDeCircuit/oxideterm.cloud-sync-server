@@ -7,7 +7,7 @@ Self-hosted cloud sync backend for [OxideTerm](https://github.com/AnalyseDeCircu
 ## Features
 
 - **Optional encryption at rest** — ChaCha20-Poly1305 AEAD with a master key you control. Blob and object payloads are encrypted when `ENCRYPTION_KEY` is set.
-- **Structured sync** — Compatible with OxideTerm Cloud Sync plugin's `structured-v1` protocol. Per-section objects for connections, forwards, settings, and more.
+- **Cloud sync protocols** — Supports v3 encrypted `.oxide` snapshots with paginated object discovery and cleanup, alongside the existing `structured-v1` metadata, blob, and object APIs.
 - **Concurrency control** — ETag-based optimistic locking is enforced for blob and object uploads.
 - **Scoped API tokens** — SHA-256 hash lookup for auth, with optional expiry, disable/enable, rotate, reveal, device binding, and usage counters.
 - **Admin web panel** — Embedded SPA for managing admin users, tokens, devices, namespace storage, sync conflicts, and lifecycle operations. Protected by bcrypt + HttpOnly session cookies, persistent login throttling, and audit logs without sensitive payloads.
@@ -20,7 +20,7 @@ Self-hosted cloud sync backend for [OxideTerm](https://github.com/AnalyseDeCircu
 | Aspect | Self-Hosted (This Server) | Third-Party / Generic Sync |
 | --- | --- | --- |
 | Encryption at rest | ChaCha20-Poly1305, key held by you | Varies; often plaintext |
-| Protocol support | Full `structured-v1` with per-section objects | Typically blob-only |
+| Protocol support | v3 `.oxide` snapshots and `structured-v1` objects | Depends on provider |
 | Concurrency control | ETag-based optimistic locking | Rarely supported |
 | Token scoping | Per-namespace pattern matching | Usually a single global key |
 | Admin panel | Built-in SPA | External tooling required |
@@ -65,6 +65,24 @@ docker compose up -d
 ```
 
 For a local source build, use `docker compose build && docker compose up -d`.
+
+### Upgrading for cloud sync v3
+
+Clients using v3 need the object listing and deletion endpoints documented below.
+If the client reports `sync_protocol_upgrade_required`, update the server to a
+build containing these endpoints. This requires no database conversion: existing
+blobs, objects and tokens remain in the same redb database.
+
+Keep the existing data volume and `ENCRYPTION_KEY`. After obtaining the updated
+source, rebuild and replace the service:
+
+```bash
+docker compose up -d --build sync-server
+```
+
+For a registry deployment, wait for a v3-capable image to be published, set
+`IMAGE_TAG` to that image tag, then run `docker compose pull sync-server` followed
+by `docker compose up -d --no-build sync-server`.
 
 ### From Source
 
@@ -213,10 +231,21 @@ When `ENCRYPTION_KEY` is *not* set:
 | `PUT` | `/v1/namespaces/:ns/metadata` | Update sync metadata |
 | `GET` | `/v1/namespaces/:ns/blob` | Download snapshot blob |
 | `PUT` | `/v1/namespaces/:ns/blob` | Upload snapshot blob (ETag concurrency) |
+| `GET` | `/v1/namespaces/:ns/objects?prefix=sync-v3/` | List object paths with prefix filtering and pagination |
 | `GET` | `/v1/namespaces/:ns/objects/*path` | Download structured object with `ETag` |
 | `PUT` | `/v1/namespaces/:ns/objects/*path` | Upload structured object (supports `If-Match` / `If-None-Match`) |
+| `DELETE` | `/v1/namespaces/:ns/objects/*path` | Remove an object and its ETag; returns `204` even if absent |
 | `GET` | `/health` | Health check (no auth) |
 | `GET` | `/ready` | Readiness check with DB + config status |
+
+Object listing requires read permission and returns
+`{"objects":[{"path":"sync-v3/device/snapshot.oxide"}],"nextCursor":null}`.
+Paths are sorted lexicographically. `prefix` defaults to empty and `limit` defaults
+to 256 (allowed range: 1–256). When `nextCursor` is non-null, pass its URL-encoded
+value as `cursor` with the same prefix to fetch the next page. An empty namespace
+returns an empty array with status `200`. Each page reflects the database at the
+time of that request. Deletion requires write permission; all operations enforce
+the token's namespace scope and reject soft-deleted namespaces.
 
 ### Admin API (requires admin session cookie)
 

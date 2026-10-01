@@ -3,7 +3,8 @@
 #![allow(clippy::result_large_err)]
 
 use redb::{Database as RedbDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -244,6 +245,49 @@ impl Database {
     }
 
     // ── Objects ──
+
+    pub fn list_object_paths(
+        &self,
+        namespace: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, redb::Error> {
+        let read_txn = self.inner.begin_read()?;
+        let table = read_txn.open_table(OBJECT_TABLE)?;
+        let namespace_prefix = object_key(namespace, "");
+        let key_prefix = object_key(namespace, prefix);
+        let start = after.map(|path| object_key(namespace, path));
+        let lower = match &start {
+            Some(key) => Bound::Excluded(key.as_str()),
+            None => Bound::Included(key_prefix.as_str()),
+        };
+        let mut paths = Vec::new();
+        // Seek directly to the cursor; listing never copies or decrypts payloads.
+        for entry in table.range::<&str>((lower, Bound::Unbounded))?.take(limit) {
+            let (key, _) = entry?;
+            if !key.value().starts_with(&key_prefix) {
+                break;
+            }
+            paths.push(key.value()[namespace_prefix.len()..].to_string());
+        }
+        Ok(paths)
+    }
+
+    pub fn delete_object(&self, namespace: &str, path: &str) -> Result<bool, redb::Error> {
+        let write_txn = self.inner.begin_write()?;
+        let removed = {
+            let mut objects = write_txn.open_table(OBJECT_TABLE)?;
+            let mut metadata = write_txn.open_table(OBJECT_META_TABLE)?;
+            let removed = objects
+                .remove(object_key(namespace, path).as_str())?
+                .is_some();
+            metadata.remove(object_meta_key(namespace, path).as_str())?;
+            removed
+        };
+        write_txn.commit()?;
+        Ok(removed)
+    }
 
     pub fn get_object(&self, namespace: &str, path: &str) -> Result<Option<Vec<u8>>, redb::Error> {
         let read_txn = self.inner.begin_read()?;
@@ -860,18 +904,31 @@ impl Database {
             .collect::<Result<HashSet<_>, _>>()?;
 
         let table = read_txn.open_table(METADATA_TABLE)?;
-        let mut namespaces = Vec::new();
+        let mut namespaces = BTreeSet::new();
         let iter = table.iter()?;
         for entry in iter {
             let entry = entry?;
             let key: &str = entry.0.value();
             if let Some(ns) = key.strip_prefix("ns:") {
                 if !deleted.contains(ns) {
-                    namespaces.push(ns.to_string());
+                    namespaces.insert(ns.to_string());
                 }
             }
         }
-        Ok(namespaces)
+        let objects = read_txn.open_table(OBJECT_TABLE)?;
+        for entry in objects.iter()? {
+            let (key, _) = entry?;
+            if let Some((ns, _)) = key
+                .value()
+                .strip_prefix("ns:")
+                .and_then(|key| key.split_once("/obj:"))
+            {
+                if !deleted.contains(ns) {
+                    namespaces.insert(ns.to_string());
+                }
+            }
+        }
+        Ok(namespaces.into_iter().collect())
     }
 
     pub fn list_deleted_namespaces(

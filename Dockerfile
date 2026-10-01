@@ -11,7 +11,7 @@ RUN cp target/x86_64-unknown-linux-musl/release/oxideterm-cloud-sync-server /bui
 
 # ── Runtime stage ──
 FROM alpine:3.21
-RUN apk add --no-cache ca-certificates tini
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tini
 RUN addgroup -S oxideterm && adduser -S oxideterm -G oxideterm
 
 # Data volume
